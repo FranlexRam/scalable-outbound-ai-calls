@@ -1,3 +1,6 @@
 .venv
 .claude
-*.env
+*.envvenv/
+.env
+venv/
+.env

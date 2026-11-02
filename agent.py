@@ -120,7 +120,11 @@ async def entrypoint(ctx: JobContext):
     agent = Agent(
         instructions=agent_instructions,
         stt=stt,
-        llm=openai.LLM(model="gpt-4o-mini"),
+        llm=openai.LLM(
+            model="anthropic/claude-haiku-5.5",
+            base_url="https://openrouter.ai/api/v1",
+            api_key=os.environ.get("OPENAI_API_KEY")
+        ),
         tts=tts,
         vad=silero.VAD.load(),
     )
