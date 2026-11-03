@@ -24,7 +24,7 @@ logger = logging.getLogger("outbound-agent")
 logging.basicConfig(level=logging.INFO)
 
 AGENT_NAME = "outbound-agent"
-SIP_TRUNK_ID = os.environ["LIVEKIT_SIP_TRUNK_ID"]
+SIP_TRUNK_ID = os.environ.get("LIVEKIT_SIP_TRUNK_ID", "")
 DEFAULT_TTS_MODEL = "cartesia/sonic-2"
 
 
@@ -48,8 +48,9 @@ async def entrypoint(ctx: JobContext):
     personalization_context: str = metadata.get("personalization_context", "")
 
     if not phone_number:
-        logger.error("No phone_number in job metadata — aborting")
-        return
+        logger.info("No phone_number in metadata. Assuming INBOUND call.")
+        agent_instructions = "You are a helpful AI receptionist for Plexus Code. Greet the caller warmly and assist them with their inquiries."
+        agent_display_name = "Plexus Voice Assistant"
 
     if language == "es":
         agent_instructions = "Responde siempre en español.\n\n" + agent_instructions
@@ -68,8 +69,8 @@ async def entrypoint(ctx: JobContext):
         )
 
     logger.info(
-        "Starting outbound call to %s as '%s' (voice=%s, language=%s)",
-        phone_number, agent_display_name, voice_id or DEFAULT_TTS_MODEL, language,
+        "Starting call as '%s' (voice=%s, language=%s)",
+        agent_display_name, voice_id or DEFAULT_TTS_MODEL, language,
     )
 
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
@@ -79,31 +80,7 @@ async def entrypoint(ctx: JobContext):
     else:
         tts = InferenceTTS(model=DEFAULT_TTS_MODEL)
 
-    # Dial out via SIP trunk before starting the agent session
-    lkapi = api.LiveKitAPI(
-        url=os.environ["LIVEKIT_URL"],
-        api_key=os.environ["LIVEKIT_API_KEY"],
-        api_secret=os.environ["LIVEKIT_API_SECRET"],
-    )
-    try:
-        await lkapi.sip.create_sip_participant(
-            api.CreateSIPParticipantRequest(
-                sip_trunk_id=SIP_TRUNK_ID,
-                sip_call_to=phone_number,
-                room_name=ctx.room.name,
-                participant_identity=f"sip_{phone_number}",
-                participant_name=f"Callee {phone_number}",
-                wait_until_answered=True,
-                media_encryption=SIP_MEDIA_ENCRYPT_DISABLE,
-            )
-        )
-    except Exception as exc:
-        logger.error("Failed to create SIP participant: %s", exc)
-        return
-    finally:
-        await lkapi.aclose()
-
-    logger.info("SIP participant created — waiting for them to join the room…")
+    logger.info("Waiting for SIP participant to join the room…")
     sip_participant = await _wait_for_sip_participant(ctx)
 
     if sip_participant is None:

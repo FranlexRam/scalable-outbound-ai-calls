@@ -36,6 +36,11 @@ E164_RE = re.compile(r"^\+[1-9]\d{7,14}$")
 LIVEKIT_URL = os.environ["LIVEKIT_URL"]
 LIVEKIT_API_KEY = os.environ["LIVEKIT_API_KEY"]
 LIVEKIT_API_SECRET = os.environ["LIVEKIT_API_SECRET"]
+
+# Nuevas variables SIP extraidas del .env
+LIVEKIT_SIP_TRUNK_ID = os.environ["LIVEKIT_SIP_TRUNK_ID"]
+TWILIO_PHONE_NUMBER = os.environ.get("TWILIO_PHONE_NUMBER", "+18133311309")
+
 AGENT_NAME = "outbound-agent"
 MAX_CAMPAIGN_CONTACTS = 500
 CAMPAIGN_DISPATCH_DELAY = 1.5           # seconds between dispatches
@@ -146,6 +151,17 @@ async def _dispatch_campaign(
                 meta["language"] = language
 
             try:
+                # 1. Crear el participante SIP (Marcar el teléfono destino vía Twilio)
+                await lk.sip.create_sip_participant(
+                    api.CreateSIPParticipantRequest(
+                        sip_trunk_id=LIVEKIT_SIP_TRUNK_ID,
+                        sip_call_to=contact["phone_number"],
+                        sip_call_from=TWILIO_PHONE_NUMBER,
+                        room_name=room_name,
+                    )
+                )
+                
+                # 2. Despachar el Agente al mismo cuarto
                 await lk.agent_dispatch.create_dispatch(
                     api.CreateAgentDispatchRequest(
                         agent_name=AGENT_NAME,
@@ -193,6 +209,17 @@ async def initiate_call(req: CallRequest):
 
     lk = _lkapi()
     try:
+        # 1. Crear el participante SIP (Marcar el teléfono destino vía Twilio)
+        await lk.sip.create_sip_participant(
+            api.CreateSIPParticipantRequest(
+                sip_trunk_id=LIVEKIT_SIP_TRUNK_ID,
+                sip_call_to=req.phone_number,
+                sip_call_from=TWILIO_PHONE_NUMBER,
+                room_name=room_name,
+            )
+        )
+
+        # 2. Despachar el Agente al mismo cuarto
         await lk.agent_dispatch.create_dispatch(
             api.CreateAgentDispatchRequest(
                 agent_name=AGENT_NAME,
@@ -201,7 +228,7 @@ async def initiate_call(req: CallRequest):
             )
         )
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to dispatch agent: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"Failed to dial or dispatch agent: {exc}") from exc
     finally:
         await lk.aclose()
 
