@@ -12,6 +12,7 @@ from livekit.agents import (
     JobContext,
     WorkerOptions,
     cli,
+    llm,
 )
 from livekit.agents.inference import TTS as InferenceTTS, STT as InferenceSTT
 from livekit.agents.voice import Agent
@@ -21,7 +22,9 @@ from livekit.plugins import openai, silero
 load_dotenv(override=True)
 
 logger = logging.getLogger("outbound-agent")
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logging.getLogger("livekit").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 AGENT_NAME = "outbound-agent"
 SIP_TRUNK_ID = os.environ.get("LIVEKIT_SIP_TRUNK_ID", "")
@@ -54,6 +57,10 @@ async def entrypoint(ctx: JobContext):
         agent_instructions = "You are a helpful AI receptionist for Plexus Code. Greet the caller warmly and assist them with their inquiries."
         agent_display_name = "Plexus Voice Assistant"
 
+    # 1. Inyectar la identidad permanentemente en la memoria base de la IA
+    agent_instructions = f"Tu identidad: Eres {agent_display_name}.\n\n" + agent_instructions
+
+    # 2. Forzar el idioma
     if language == "es":
         agent_instructions = "Responde siempre en español.\n\n" + agent_instructions
 
@@ -69,6 +76,14 @@ async def entrypoint(ctx: JobContext):
             + "\n\nAdditional context about the person you're calling:\n"
             + personalization_context
         )
+
+    agent_instructions = (
+        agent_instructions
+        + "\n\nREGLA CRÍTICA DE LATENCIA: Eres un asistente de voz telefónico en tiempo real. "
+        "Tus respuestas deben ser EXTREMADAMENTE concisas, de máximo 1 o 2 oraciones cortas. "
+        "Habla rápido y directo al grano, como en una conversación humana real. "
+        "NUNCA generes párrafos largos, listas, ni explicaciones extensas."
+    )
 
     logger.info(
         "Starting call as '%s' (voice=%s, language=%s)",
@@ -114,10 +129,26 @@ async def entrypoint(ctx: JobContext):
             api_key=llm_api_key,
         ),
         tts=tts,
-        vad=silero.VAD.load(),
+        vad=silero.VAD.load(min_silence_duration=0.4),
     )
 
-    session = AgentSession()
+    session = AgentSession(
+        min_endpointing_delay=0.4,
+        max_endpointing_delay=1.0,
+    )
+
+    @session.on("conversation_item_added")
+    def on_conversation_item_added(event):
+        item = getattr(event, "item", event)
+        role = getattr(item, "role", None)
+        text = getattr(item, "text_content", None) or getattr(item, "content", "")
+        if isinstance(text, list):
+            text = " ".join(str(part) for part in text if part)
+        if role == "user":
+            print(f"\n👤 [{contact_name or 'Usuario'}]: {text}", flush=True)
+        elif role == "assistant":
+            print(f"\n🤖 [{agent_display_name}]: {text}\n", flush=True)
+
     await session.start(
         agent=agent,
         room=ctx.room,
