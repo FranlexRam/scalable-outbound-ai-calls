@@ -365,7 +365,7 @@
             <span class="tech-chip">LiveKit</span>
             <span class="tech-chip">Twilio</span>
             <span class="tech-chip">Deepgram</span>
-            <span class="tech-chip">ElevenLabs</span>
+            <span class="tech-chip">Cartesia</span>
           </div>
         </div>
       </div>
@@ -402,11 +402,10 @@
 
         <!-- Provider filter chips -->
         <div class="chip-row flex gap-1 border-b border-gray-800">
-          <button onclick="filterProvider('all')"        id="vf-all"        class="vf-btn px-3 py-1.5 text-xs font-medium border-b-2 transition-colors -mb-px">All</button>
-          <button onclick="filterProvider('Cartesia')"   id="vf-Cartesia"   class="vf-btn px-3 py-1.5 text-xs font-medium border-b-2 transition-colors -mb-px">Cartesia</button>
-          <button onclick="filterProvider('Deepgram')"   id="vf-Deepgram"   class="vf-btn px-3 py-1.5 text-xs font-medium border-b-2 transition-colors -mb-px">Deepgram</button>
-          <button onclick="filterProvider('Rime')"       id="vf-Rime"       class="vf-btn px-3 py-1.5 text-xs font-medium border-b-2 transition-colors -mb-px">Rime</button>
-          <button onclick="filterProvider('ElevenLabs')" id="vf-ElevenLabs" class="vf-btn px-3 py-1.5 text-xs font-medium border-b-2 transition-colors -mb-px">ElevenLabs</button>
+          <button onclick="filterProvider('all')"      id="vf-all"      class="vf-btn px-3 py-1.5 text-xs font-medium border-b-2 transition-colors -mb-px">All</button>
+          <button onclick="filterProvider('Cartesia')" id="vf-Cartesia" class="vf-btn px-3 py-1.5 text-xs font-medium border-b-2 transition-colors -mb-px">Cartesia</button>
+          <button onclick="filterProvider('Deepgram')" id="vf-Deepgram" class="vf-btn px-3 py-1.5 text-xs font-medium border-b-2 transition-colors -mb-px">Deepgram</button>
+          <button onclick="filterProvider('Rime')"     id="vf-Rime"     class="vf-btn px-3 py-1.5 text-xs font-medium border-b-2 transition-colors -mb-px">Rime</button>
         </div>
 
         <!-- Language filter -->
@@ -707,6 +706,14 @@
     { id: "cartesia/sonic-2:f9836c6e-a0bd-460e-9d3c-f7299fa60f94",  name: "Friendly Sidekick",    provider: "Cartesia",    gender: "Female", language: "en" },
     { id: "cartesia/sonic-2:5c42302c-194b-4d0c-ba1a-8cb485c84ab9",  name: "Female Nurse",         provider: "Cartesia",    gender: "Female", language: "en" },
     { id: "cartesia/sonic-2:694f9389-aac1-45b6-b726-9d9369183238",  name: "Newsman",              provider: "Cartesia",    gender: "Male",   language: "en" },
+    
+    // ── Cartesia (Spanish) ────────────────────────────────────────────────
+    { id: "cartesia/sonic-2:bef2ba57-5c10-433b-b215-3bef35110a81",  name: "Camila",               provider: "Cartesia",    gender: "Female", language: "es" },
+    { id: "cartesia/sonic-2:5c5ad5e7-1020-476b-8b91-fdcbe9cc313c",  name: "Daniela",              provider: "Cartesia",    gender: "Female", language: "es" },
+    { id: "cartesia/sonic-2:cefcb124-080b-4655-b31f-932f3ee743de",  name: "Elena - Narrator",     provider: "Cartesia",    gender: "Female", language: "es" },
+    { id: "cartesia/sonic-2:7b001dff-b8b2-4da7-92e4-5c794798effa",  name: "Jorge",                provider: "Cartesia",    gender: "Male",   language: "es" },
+    { id: "cartesia/sonic-2:846fa30b-6e1a-49b9-b7df-6be47092a09a",  name: "Pablo",                provider: "Cartesia",    gender: "Male",   language: "es" },
+
     // ── Deepgram Aura-2 (English) ─────────────────────────────────────────
     { id: "deepgram/aura-2:aura-2-asteria-en",                       name: "Asteria",              provider: "Deepgram",    gender: "Female", language: "en" },
     { id: "deepgram/aura-2:aura-2-luna-en",                          name: "Luna",                 provider: "Deepgram",    gender: "Female", language: "en" },
@@ -720,6 +727,13 @@
     { id: "deepgram/aura-2:aura-2-orion-en",                         name: "Orion",                provider: "Deepgram",    gender: "Male",   language: "en" },
     { id: "deepgram/aura-2:aura-2-apollo-en",                        name: "Apollo",               provider: "Deepgram",    gender: "Male",   language: "en" },
     { id: "deepgram/aura-2:aura-2-arcas-en",                         name: "Arcas",                provider: "Deepgram",    gender: "Male",   language: "en" },
+    
+    // ── Deepgram (Spanish) ────────────────────────────────────────────────
+    { id: "deepgram/aura-2:aura-2-antonia-es",                       name: "Antonia",              provider: "Deepgram",    gender: "Female", language: "es" },
+    { id: "deepgram/aura-2:aura-2-aquila-es",                        name: "Aquila",               provider: "Deepgram",    gender: "Female", language: "es" },
+    { id: "deepgram/aura-2:aura-2-celeste-es",                       name: "Celeste",              provider: "Deepgram",    gender: "Female", language: "es" },
+    { id: "deepgram/aura-2:aura-2-sirio-es",                         name: "Sirio",                provider: "Deepgram",    gender: "Male",   language: "es" },
+
     // ── Rime (English) ────────────────────────────────────────────────────
     { id: "rime/mistv2:cove",                                         name: "Cove",                 provider: "Rime",        gender: "Male",   language: "en" },
     { id: "rime/mistv2:marsh",                                        name: "Marsh",                provider: "Rime",        gender: "Male",   language: "en" },
@@ -728,20 +742,15 @@
     { id: "rime/mistv2:brook",                                        name: "Brook",                provider: "Rime",        gender: "Female", language: "en" },
     { id: "rime/mistv2:aurora",                                       name: "Aurora",               provider: "Rime",        gender: "Female", language: "en" },
     { id: "rime/mistv2:canyon",                                       name: "Canyon",               provider: "Rime",        gender: "Female", language: "en" },
-    // ── ElevenLabs Multilingual (Spanish / English) ───────────────────────
-    { id: "elevenlabs/eleven_multilingual_v2:21m00Tcm4TlvDq8ikWAM",  name: "Rachel",               provider: "ElevenLabs",  gender: "Female", language: "es" },
-    { id: "elevenlabs/eleven_multilingual_v2:pNInz6obpgDQGcFmaJgB",  name: "Adam",                 provider: "ElevenLabs",  gender: "Male",   language: "es" },
-    { id: "elevenlabs/eleven_multilingual_v2:ErXwobaYiN019PkySvjV",  name: "Antoni",               provider: "ElevenLabs",  gender: "Male",   language: "es" },
-    { id: "elevenlabs/eleven_multilingual_v2:AZnzlk1XvdvUeBnXmlld",  name: "Domi",                 provider: "ElevenLabs",  gender: "Female", language: "es" },
-    { id: "elevenlabs/eleven_multilingual_v2:MF3mGyEYCl7XYWbV9V6O",  name: "Elli",                 provider: "ElevenLabs",  gender: "Female", language: "es" },
-    { id: "elevenlabs/eleven_multilingual_v2:TxGEqnHWrfWFTfGW9XjX",  name: "Josh",                 provider: "ElevenLabs",  gender: "Male",   language: "es" },
+    
+    // ── Rime (Spanish) ────────────────────────────────────────────────────
+    { id: "rime/mistv2:serena",                                       name: "Serena",               provider: "Rime",        gender: "Female", language: "es" },
   ];
 
   const PROVIDER_BADGE = {
     Cartesia:   "bg-violet-900 text-violet-300",
     Deepgram:   "bg-blue-900 text-blue-300",
     Rime:       "bg-teal-900 text-teal-300",
-    ElevenLabs: "bg-orange-900 text-orange-300",
   };
 
   let currentVoiceFilter = 'all';
@@ -756,7 +765,7 @@
 
   function filterProvider(provider) {
     currentVoiceFilter = provider;
-    ['all','Cartesia','Deepgram','Rime','ElevenLabs'].forEach(p => {
+    ['all','Cartesia','Deepgram','Rime'].forEach(p => {
       const btn = document.getElementById(`vf-${p}`);
       if (!btn) return;
       if (p === provider) {
@@ -922,7 +931,9 @@
     renderVoices();
 
     try {
-      const url = `${BACKEND}/voice-preview?voice_id=${encodeURIComponent(voiceId)}`;
+      const voiceObj = LIVEKIT_VOICES.find(v => v.id === voiceId);
+      const langParam = voiceObj && voiceObj.language ? `&language=${encodeURIComponent(voiceObj.language)}` : '';
+      const url = `${BACKEND}/voice-preview?voice_id=${encodeURIComponent(voiceId)}${langParam}`;
       const res = await fetch(url);
       if (!res.ok) {
         const err = await res.json().catch(() => ({ detail: res.statusText }));

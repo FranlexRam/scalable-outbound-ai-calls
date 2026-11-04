@@ -336,9 +336,15 @@ async def get_campaign(campaign_id: str):
 
 
 @app.get("/voice-preview")
-async def voice_preview(voice_id: str = Query(..., description="Voice model string, e.g. cartesia/sonic-2:voice-uuid")):
+async def voice_preview(
+    voice_id: str = Query(..., description="Voice model string, e.g. cartesia/sonic-2:voice-uuid"),
+    language: str = Query("en", description="Language code, e.g. en or es"),
+):
     """Synthesize a short sample phrase with the given voice and return WAV audio."""
-    sample_text = "Hello! I'm your AI assistant. How can I help you today?"
+    if language == "es":
+        sample_text = "¡Hola! Soy tu asistente de inteligencia artificial. ¿En qué puedo ayudarte hoy?"
+    else:
+        sample_text = "Hello! I'm your AI assistant. How can I help you today?"
 
     # Parse "provider/model:voice-id" → model + voice
     model = voice_id
@@ -350,10 +356,13 @@ async def voice_preview(voice_id: str = Query(..., description="Voice model stri
 
     try:
         async with aiohttp.ClientSession() as http_session:
+            tts_kwargs: Dict[str, Any] = {"model": model, "http_session": http_session}
             if voice:
-                tts = InferenceTTS(model=model, voice=voice, http_session=http_session)
-            else:
-                tts = InferenceTTS(model=model, http_session=http_session)
+                tts_kwargs["voice"] = voice
+            if not model.startswith("deepgram/"):
+                tts_kwargs["language"] = language
+
+            tts = InferenceTTS(**tts_kwargs)
 
             audio_chunks: list[bytes] = []
             sample_rate = 24000
