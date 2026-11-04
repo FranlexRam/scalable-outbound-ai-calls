@@ -6,7 +6,7 @@ import re
 import time
 import uuid
 import wave
-from typing import Any, Dict, List, Optional  # List kept for campaign contacts type
+from typing import Any, Dict, List, Optional
 
 import aiohttp
 from dotenv import load_dotenv
@@ -156,8 +156,9 @@ async def _dispatch_campaign(
                     api.CreateSIPParticipantRequest(
                         sip_trunk_id=LIVEKIT_SIP_TRUNK_ID,
                         sip_call_to=contact["phone_number"],
-                        sip_call_from=TWILIO_PHONE_NUMBER,
                         room_name=room_name,
+                        participant_identity=f"sip_{contact['phone_number']}",
+                        participant_name=f"Callee {contact['phone_number']}",
                     )
                 )
                 
@@ -214,8 +215,9 @@ async def initiate_call(req: CallRequest):
             api.CreateSIPParticipantRequest(
                 sip_trunk_id=LIVEKIT_SIP_TRUNK_ID,
                 sip_call_to=req.phone_number,
-                sip_call_from=TWILIO_PHONE_NUMBER,
                 room_name=room_name,
+                participant_identity=f"sip_{req.phone_number}",
+                participant_name=f"Callee {req.phone_number}",
             )
         )
 

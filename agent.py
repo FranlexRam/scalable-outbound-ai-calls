@@ -18,7 +18,7 @@ from livekit.agents.voice import Agent
 from livekit.agents.voice.room_io import RoomInputOptions
 from livekit.plugins import openai, silero
 
-load_dotenv()
+load_dotenv(override=True)
 
 logger = logging.getLogger("outbound-agent")
 logging.basicConfig(level=logging.INFO)
@@ -29,6 +29,8 @@ DEFAULT_TTS_MODEL = "cartesia/sonic-2"
 
 
 async def entrypoint(ctx: JobContext):
+    load_dotenv(override=True)
+
     metadata: dict = {}
     if ctx.job.metadata:
         try:
@@ -94,13 +96,22 @@ async def entrypoint(ctx: JobContext):
     else:
         stt = InferenceSTT(model="deepgram/nova-2-phonecall")
 
+    llm_api_key = (
+        os.environ.get("OPENROUTER_API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+        or ""
+    ).strip()
+
+    if not llm_api_key:
+        logger.error("CRITICAL: No OPENROUTER_API_KEY or OPENAI_API_KEY found in .env!")
+
     agent = Agent(
         instructions=agent_instructions,
         stt=stt,
         llm=openai.LLM(
             model="anthropic/claude-haiku-5.5",
             base_url="https://openrouter.ai/api/v1",
-            api_key=os.environ.get("OPENAI_API_KEY")
+            api_key=llm_api_key,
         ),
         tts=tts,
         vad=silero.VAD.load(),
