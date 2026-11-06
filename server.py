@@ -45,6 +45,11 @@ AGENT_NAME = "outbound-agent"
 MAX_CAMPAIGN_CONTACTS = 500
 CAMPAIGN_DISPATCH_DELAY = 1.5           # seconds between dispatches
 
+# Candados de seguridad en LiveKit Cloud contra llamadas zombis (segundos)
+ROOM_EMPTY_TIMEOUT = int(os.environ.get("ROOM_EMPTY_TIMEOUT", "30"))
+ROOM_DEPARTURE_TIMEOUT = int(os.environ.get("ROOM_DEPARTURE_TIMEOUT", "15"))
+MAX_CALL_DURATION_SECONDS = int(os.environ.get("MAX_CALL_DURATION_SECONDS", "180"))
+
 # In-memory campaign store: campaign_id → campaign dict
 # Each contact: {phone_number, personalization_context, status, room_name, error, dispatched_at}
 campaigns: Dict[str, Dict[str, Any]] = {}
@@ -88,6 +93,15 @@ class CallRequest(BaseModel):
         if not E164_RE.match(v):
             raise ValueError("phone_number must be E.164 format (e.g. +12125551234)")
         return v
+
+
+class WebCallRequest(BaseModel):
+    instructions: str = "You are a friendly assistant making a courtesy call. Be warm, concise, and helpful."
+    agent_name: str = "Daniela"
+    voice_id: Optional[str] = None
+    language: Optional[str] = "es"
+    contact_name: str = "Franlex"
+    personalization_context: str = ""
 
 
 class CallResponse(BaseModel):
@@ -144,6 +158,7 @@ async def _dispatch_campaign(
                 "agent_name": agent_name,
                 "contact_name": contact.get("contact_name", ""),
                 "personalization_context": contact["personalization_context"],
+                "max_call_duration": MAX_CALL_DURATION_SECONDS,
             }
             if voice_id:
                 meta["voice_id"] = voice_id
@@ -151,7 +166,25 @@ async def _dispatch_campaign(
                 meta["language"] = language
 
             try:
-                # 1. Crear el participante SIP (Marcar el teléfono destino vía Twilio)
+                # 0. Pre-crear sala con autodestrucción automática en LiveKit Cloud
+                await lk.room.create_room(
+                    api.CreateRoomRequest(
+                        name=room_name,
+                        empty_timeout=ROOM_EMPTY_TIMEOUT,
+                        departure_timeout=ROOM_DEPARTURE_TIMEOUT,
+                    )
+                )
+
+                # 1. Despachar el Agente al mismo cuarto
+                await lk.agent_dispatch.create_dispatch(
+                    api.CreateAgentDispatchRequest(
+                        agent_name=AGENT_NAME,
+                        room=room_name,
+                        metadata=json.dumps(meta),
+                    )
+                )
+
+                # 2. Crear el participante SIP (Marcar el teléfono destino vía Twilio)
                 await lk.sip.create_sip_participant(
                     api.CreateSIPParticipantRequest(
                         sip_trunk_id=LIVEKIT_SIP_TRUNK_ID,
@@ -159,15 +192,6 @@ async def _dispatch_campaign(
                         room_name=room_name,
                         participant_identity=f"sip_{contact['phone_number']}",
                         participant_name=f"Callee {contact['phone_number']}",
-                    )
-                )
-                
-                # 2. Despachar el Agente al mismo cuarto
-                await lk.agent_dispatch.create_dispatch(
-                    api.CreateAgentDispatchRequest(
-                        agent_name=AGENT_NAME,
-                        room=room_name,
-                        metadata=json.dumps(meta),
                     )
                 )
                 contact["status"] = "dispatched"
@@ -202,6 +226,7 @@ async def initiate_call(req: CallRequest):
         "agent_name": req.agent_name,
         "contact_name": req.contact_name,
         "personalization_context": req.personalization_context,
+        "max_call_duration": MAX_CALL_DURATION_SECONDS,
     }
     if req.voice_id:
         meta["voice_id"] = req.voice_id
@@ -210,7 +235,25 @@ async def initiate_call(req: CallRequest):
 
     lk = _lkapi()
     try:
-        # 1. Crear el participante SIP (Marcar el teléfono destino vía Twilio)
+        # 0. Pre-crear sala con autodestrucción automática en LiveKit Cloud
+        await lk.room.create_room(
+            api.CreateRoomRequest(
+                name=room_name,
+                empty_timeout=ROOM_EMPTY_TIMEOUT,
+                departure_timeout=ROOM_DEPARTURE_TIMEOUT,
+            )
+        )
+
+        # 1. Despachar el Agente al mismo cuarto
+        await lk.agent_dispatch.create_dispatch(
+            api.CreateAgentDispatchRequest(
+                agent_name=AGENT_NAME,
+                room=room_name,
+                metadata=json.dumps(meta),
+            )
+        )
+
+        # 2. Crear el participante SIP (Marcar el teléfono destino vía Twilio)
         await lk.sip.create_sip_participant(
             api.CreateSIPParticipantRequest(
                 sip_trunk_id=LIVEKIT_SIP_TRUNK_ID,
@@ -218,15 +261,6 @@ async def initiate_call(req: CallRequest):
                 room_name=room_name,
                 participant_identity=f"sip_{req.phone_number}",
                 participant_name=f"Callee {req.phone_number}",
-            )
-        )
-
-        # 2. Despachar el Agente al mismo cuarto
-        await lk.agent_dispatch.create_dispatch(
-            api.CreateAgentDispatchRequest(
-                agent_name=AGENT_NAME,
-                room=room_name,
-                metadata=json.dumps(meta),
             )
         )
     except Exception as exc:
@@ -239,6 +273,69 @@ async def initiate_call(req: CallRequest):
         room_name=room_name,
         message=f"Outbound call to {req.phone_number} dispatched. Room: {room_name}",
     )
+
+
+@app.post("/web-call")
+async def initiate_web_call(req: WebCallRequest):
+    """Inicia una llamada de prueba 100% gratuita por WebRTC (Navegador) sin usar Twilio."""
+    room_name = f"call-web-{uuid.uuid4().hex[:8]}"
+    participant_identity = f"web_{uuid.uuid4().hex[:6]}"
+
+    meta: dict = {
+        "phone_number": "WEBRTC_BROWSER",
+        "agent_instructions": req.instructions,
+        "agent_name": req.agent_name,
+        "contact_name": req.contact_name,
+        "personalization_context": req.personalization_context,
+        "max_call_duration": MAX_CALL_DURATION_SECONDS,
+    }
+    if req.voice_id:
+        meta["voice_id"] = req.voice_id
+    if req.language:
+        meta["language"] = req.language
+
+    lk = _lkapi()
+    try:
+        await lk.room.create_room(
+            api.CreateRoomRequest(
+                name=room_name,
+                empty_timeout=ROOM_EMPTY_TIMEOUT,
+                departure_timeout=ROOM_DEPARTURE_TIMEOUT,
+            )
+        )
+        await lk.agent_dispatch.create_dispatch(
+            api.CreateAgentDispatchRequest(
+                agent_name=AGENT_NAME,
+                room=room_name,
+                metadata=json.dumps(meta),
+            )
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to start web call: {exc}") from exc
+    finally:
+        await lk.aclose()
+
+    token = (
+        api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+        .with_identity(participant_identity)
+        .with_name(req.contact_name or "Web Tester")
+        .with_grants(
+            api.VideoGrants(
+                room_join=True,
+                room=room_name,
+                can_publish=True,
+                can_subscribe=True,
+            )
+        )
+        .to_jwt()
+    )
+
+    return {
+        "success": True,
+        "room_name": room_name,
+        "livekit_url": LIVEKIT_URL,
+        "token": token,
+    }
 
 
 @app.get("/active-calls")

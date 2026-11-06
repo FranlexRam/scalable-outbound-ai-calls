@@ -31,6 +31,44 @@ SIP_TRUNK_ID = os.environ.get("LIVEKIT_SIP_TRUNK_ID", "")
 DEFAULT_TTS_MODEL = "cartesia/sonic-2"
 
 
+async def _hangup_room(room_name: str) -> None:
+    """Destruye la sala en LiveKit Cloud para forzar el corte SIP BYE inmediato en Twilio."""
+    if not room_name or room_name == "console":
+        return
+    lk_url = os.environ.get("LIVEKIT_URL", "")
+    lk_key = os.environ.get("LIVEKIT_API_KEY", "")
+    lk_secret = os.environ.get("LIVEKIT_API_SECRET", "")
+    if not (lk_url and lk_key and lk_secret):
+        return
+    lk = api.LiveKitAPI(url=lk_url, api_key=lk_key, api_secret=lk_secret)
+    try:
+        await lk.room.delete_room(api.DeleteRoomRequest(room=room_name))
+        logger.info("🔒 [KILL-SWITCH] Room '%s' deleted in LiveKit Cloud (SIP call terminated).", room_name)
+    except Exception as exc:
+        logger.debug("Room cleanup note for %s: %s", room_name, exc)
+    finally:
+        await lk.aclose()
+
+
+async def _delayed_hangup(room_name: str, delay: float = 4.0) -> None:
+    await asyncio.sleep(delay)
+    await _hangup_room(room_name)
+
+
+async def _call_duration_watchdog(room_name: str, max_seconds: int) -> None:
+    """Corta la llamada automáticamente si supera el tiempo máximo permitido."""
+    try:
+        await asyncio.sleep(max_seconds)
+        logger.warning(
+            "⏰ [WATCHDOG] Max call duration (%ds) reached for room '%s' — forcing hangup.",
+            max_seconds,
+            room_name,
+        )
+        await _hangup_room(room_name)
+    except asyncio.CancelledError:
+        pass
+
+
 async def entrypoint(ctx: JobContext):
     load_dotenv(override=True)
 
@@ -41,21 +79,25 @@ async def entrypoint(ctx: JobContext):
         except json.JSONDecodeError:
             logger.warning("Could not parse job metadata as JSON")
 
+    # Valores por defecto amigables para pruebas locales en modo consola o web
     phone_number: str = metadata.get("phone_number", "")
     agent_instructions: str = metadata.get(
         "agent_instructions",
-        "You are a friendly assistant making a courtesy call. Be warm, concise, and helpful.",
+        (
+            "Eres asesora de atención al cliente de Zen Spa. Cuando el cliente confirme que es él después del aló, "
+            "salúdalo con calma, dile que lo llamas rapidito de Zen Spa para regalarle un cincuenta por ciento de descuento "
+            "en depilación láser por ser cliente de la casa, y pregúntale si tiene un minutito. "
+            "Si acepta agendar la valoración gratuita, pregúntale qué día de la semana le queda más cómodo, en la mañana o en la tarde."
+        ),
     )
-    agent_display_name: str = metadata.get("agent_name", "AI Assistant")
-    voice_id: str | None = metadata.get("voice_id") or None
-    language: str = metadata.get("language") or "en"
-    contact_name: str = metadata.get("contact_name", "")
-    personalization_context: str = metadata.get("personalization_context", "")
-
-    if not phone_number:
-        logger.info("No phone_number in metadata. Assuming INBOUND call.")
-        agent_instructions = "You are a helpful AI receptionist for Plexus Code. Greet the caller warmly and assist them with their inquiries."
-        agent_display_name = "Plexus Voice Assistant"
+    agent_display_name: str = metadata.get("agent_name", "Daniela")
+    voice_id: str | None = metadata.get("voice_id") or "cartesia/sonic-2:5c5ad5e7-1020-476b-8b91-fdcbe9cc313c"
+    language: str = metadata.get("language") or "es"
+    contact_name: str = metadata.get("contact_name", "Franlex")
+    personalization_context: str = metadata.get(
+        "personalization_context",
+        "Cliente frecuente de Zen Spa. Beneficio de cincuenta por ciento de descuento en paquetes de depilación láser definitiva.",
+    )
 
     if language == "es":
         # 1. Identidad y contexto 100% en Español
@@ -81,7 +123,7 @@ async def entrypoint(ctx: JobContext):
             "3. ESCRITURA FONÉTICA: Escribe TODOS los números, porcentajes y horas en letras minúsculas exactamente como se pronuncian (ejemplo: escribe 'cincuenta por ciento' en lugar de '50%', 'diez de la mañana' en lugar de '10 am').\n"
             "4. MULETILLAS FLUIDAS AL INICIAR: Inicia tus respuestas con conectores naturales seguidos de coma como 'Claro, mira,', 'Ah, entiendo,', 'Sí, te cuento rapidito,', 'Bueno, fíjate que'. NUNCA pongas puntos suspensivos (...) en las primeras palabras para no retrasar el inicio de tu voz.\n"
             "5. DOSIFICACIÓN DE INFORMACIÓN: NUNCA sueltes todo el discurso de golpe. Habla en turnos muy breves de 1 sola oración (máximo 15 a 22 palabras) y termina con una pregunta corta y natural para escuchar al cliente.\n"
-            "6. FLUJO DESPUÉS DEL ALÓ: Cuando el cliente responda a tu '¿Aló?', preséntate brevemente, menciona el motivo en una frase sencilla y pregúntale si tiene un minutito."
+            "6. FLUJO DESPUÉS DEL ALÓ Y CIERRE: Cuando el cliente responda a tu '¿Aló?', preséntate brevemente, menciona el motivo en una frase sencilla y pregúntale si tiene un minutito. Cuando la conversación termine y te despidas (o si te dicen número equivocado / no interesado), despídete amablemente y ejecuta la herramienta end_call."
         )
     else:
         # 1. Identidad y contexto 100% en Inglés
@@ -107,7 +149,7 @@ async def entrypoint(ctx: JobContext):
             "3. PHONETIC SPELLING: Spell out ALL numbers, percentages, and times in lowercase words exactly as spoken (e.g., write 'fifty percent' instead of '50%', 'ten in the morning' instead of '10 am').\n"
             "4. FLUENT FILLERS AT START: Start responses with natural connectors followed by a comma like 'Yeah, so,', 'Oh, got it,', 'Sure, real quick,'. NEVER put ellipses (...) in the first few words so your voice starts immediately.\n"
             "5. PACING AND TURN LENGTH: NEVER deliver a long pitch all at once. Keep every turn to 1 short sentence (15 to 22 words max) and end with a natural, low-pressure question.\n"
-            "6. POST-HELLO FLOW: Once the person replies to your initial 'Hello?', introduce yourself briefly, mention the main reason for calling in one simple phrase, and ask if caught them at a good time."
+            "6. POST-HELLO FLOW AND HANGUP: Once the person replies to your initial 'Hello?', introduce yourself briefly, mention the main reason for calling in one simple phrase, and ask if caught them at a good time. When the conversation concludes and you say goodbye, call the end_call tool."
         )
 
     logger.info(
@@ -133,14 +175,20 @@ async def entrypoint(ctx: JobContext):
 
     tts = InferenceTTS(**tts_kwargs)
 
-    logger.info("Waiting for SIP participant to join the room…")
-    sip_participant = await _wait_for_sip_participant(ctx)
+    # Detectar si estamos en modo consola local (gratis) o en sala LiveKit (SIP / WebRTC)
+    is_console_mode = ctx.room.name in ("console", "mock_room", "") or len(sys_argv := os.sys.argv) > 1 and "console" in sys_argv
+    target_participant = None
 
-    if sip_participant is None:
-        logger.error("SIP participant never joined — ending session")
-        return
+    if not is_console_mode:
+        logger.info("Waiting for participant (SIP or WebRTC) to join the room…")
+        target_participant = await _wait_for_call_participant(ctx)
 
-    logger.info("SIP participant joined: %s — starting agent session", sip_participant.identity)
+        if target_participant is None:
+            logger.error("Participant never joined — destroying room to prevent zombie billing")
+            await _hangup_room(ctx.room.name)
+            return
+
+        logger.info("Participant joined: %s — starting agent session", target_participant.identity)
 
     if language == "es":
         stt = InferenceSTT(model="deepgram/nova-2", language="es")
@@ -156,6 +204,17 @@ async def entrypoint(ctx: JobContext):
     if not llm_api_key:
         logger.error("CRITICAL: No OPENROUTER_API_KEY or OPENAI_API_KEY found in .env!")
 
+    @llm.function_tool(
+        description=(
+            "Call this tool to hang up and end the phone call ONLY AFTER you have said your final goodbye "
+            "(for example, after confirming an appointment and saying goodbye, or when the user says wrong number / not interested)."
+        )
+    )
+    async def end_call() -> str:
+        logger.info("📴 Agent triggered end_call tool — scheduling room hangup in 4 seconds…")
+        asyncio.create_task(_delayed_hangup(ctx.room.name, delay=4.0))
+        return "Call termination scheduled."
+
     agent = Agent(
         instructions=agent_instructions,
         stt=stt,
@@ -170,6 +229,7 @@ async def entrypoint(ctx: JobContext):
             min_silence_duration=0.35,
             activation_threshold=0.60,
         ),
+        tools=[end_call],
     )
 
     session = AgentSession(
@@ -224,13 +284,28 @@ async def entrypoint(ctx: JobContext):
         elif role == "assistant":
             print(f"\n🤖 [{agent_display_name}]: {text}\n", flush=True)
 
+    room_input_opts = (
+        RoomInputOptions(participant_identity=target_participant.identity)
+        if target_participant is not None
+        else RoomInputOptions()
+    )
+
     await session.start(
         agent=agent,
         room=ctx.room,
-        room_input_options=RoomInputOptions(
-            participant_identity=sip_participant.identity,
-        ),
+        room_input_options=room_input_opts,
     )
+
+    # Watchdog de seguridad financiera: corta la llamada si supera max_call_duration (por defecto 180s)
+    max_duration = int(metadata.get("max_call_duration", os.environ.get("MAX_CALL_DURATION_SECONDS", "180")))
+    watchdog_task = asyncio.create_task(_call_duration_watchdog(ctx.room.name, max_duration))
+
+    # Si el participante cuelga desde su teléfono o navegador, destruir la sala inmediatamente
+    @ctx.room.on("participant_disconnected")
+    def on_participant_disconnected(participant):
+        if target_participant and participant.identity == target_participant.identity:
+            logger.info("📴 Participant %s disconnected — destroying room immediately.", participant.identity)
+            asyncio.create_task(_hangup_room(ctx.room.name))
 
     # Handshake telefónico en 2 fases: primero confirmar línea antes de lanzar el pitch
     if language == "es":
@@ -254,15 +329,16 @@ async def entrypoint(ctx: JobContext):
     await session.generate_reply(instructions=greeting)
 
 
-async def _wait_for_sip_participant(ctx: JobContext, timeout: float = 60.0):
+async def _wait_for_call_participant(ctx: JobContext, timeout: float = 60.0):
+    """Acepta tanto participantes telefónicos (sip_) como de prueba web gratuita (web_)."""
     for p in ctx.room.remote_participants.values():
-        if p.identity.startswith("sip_"):
+        if p.identity.startswith(("sip_", "web_", "user")):
             return p
 
     future: asyncio.Future = asyncio.get_event_loop().create_future()
 
     def on_participant_connected(participant):
-        if participant.identity.startswith("sip_") and not future.done():
+        if participant.identity.startswith(("sip_", "web_", "user")) and not future.done():
             future.set_result(participant)
 
     ctx.room.on("participant_connected", on_participant_connected)
@@ -270,7 +346,7 @@ async def _wait_for_sip_participant(ctx: JobContext, timeout: float = 60.0):
     try:
         return await asyncio.wait_for(future, timeout=timeout)
     except asyncio.TimeoutError:
-        logger.error("Timed out waiting for SIP participant to join")
+        logger.error("Timed out waiting for participant to join")
         return None
     finally:
         ctx.room.off("participant_connected", on_participant_connected)
