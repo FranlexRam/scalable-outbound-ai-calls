@@ -53,15 +53,25 @@ async def _hangup_room(room_name: str) -> None:
 async def _terminate_call_session(
     ctx: JobContext,
     session: AgentSession,
-    delay: float = 3.5,
+    delay: float = 5.5,
 ) -> None:
-    """Espera a que termine de reproducirse la despedida, destruye la sala SIP/Cloud y apaga la sesión local."""
+    """Espera a que termine de reproducirse toda la frase de despedida, destruye la sala SIP/Cloud y apaga la sesión."""
     try:
         session.input.set_audio_enabled(False)
     except Exception:
         pass
 
-    await asyncio.sleep(delay)
+    # Esperar primero a que el LLM y TTS generen y reproduzcan el audio de despedida
+    await asyncio.sleep(1.5)
+    try:
+        if getattr(session, "current_speech", None) is not None:
+            await asyncio.wait_for(session.current_speech.wait_for_playout(), timeout=delay)
+        else:
+            await asyncio.sleep(delay - 1.5)
+    except Exception:
+        await asyncio.sleep(3.5)
+
+    await asyncio.sleep(0.8)
     await _hangup_room(ctx.room.name)
 
     try:
@@ -211,9 +221,9 @@ async def entrypoint(ctx: JobContext):
         logger.info("Participant joined: %s — starting agent session", target_participant.identity)
 
     if language == "es":
-        stt = InferenceSTT(model="deepgram/nova-2", language="es")
+        stt = InferenceSTT(model="deepgram/nova-3", language="es")
     else:
-        stt = InferenceSTT(model="deepgram/nova-2-phonecall")
+        stt = InferenceSTT(model="deepgram/nova-3", language="en")
 
     llm_api_key = (
         os.environ.get("OPENROUTER_API_KEY")
@@ -225,8 +235,8 @@ async def entrypoint(ctx: JobContext):
         logger.error("CRITICAL: No OPENROUTER_API_KEY or OPENAI_API_KEY found in .env!")
 
     session = AgentSession(
-        min_endpointing_delay=0.25,
-        max_endpointing_delay=1.2,
+        min_endpointing_delay=0.20,
+        max_endpointing_delay=0.60,
     )
 
     call_ending = False
@@ -242,8 +252,8 @@ async def entrypoint(ctx: JobContext):
         if call_ending:
             return None
         call_ending = True
-        logger.info("📴 Agent triggered end_call tool — hanging up after goodbye finishes…")
-        asyncio.create_task(_terminate_call_session(ctx, session, delay=3.5))
+        logger.info("📴 Agent triggered end_call tool — waiting for goodbye audio to finish before hanging up…")
+        asyncio.create_task(_terminate_call_session(ctx, session, delay=5.5))
         return None
 
     agent = Agent(
@@ -257,7 +267,7 @@ async def entrypoint(ctx: JobContext):
         ),
         tts=tts,
         vad=silero.VAD.load(
-            min_silence_duration=0.35,
+            min_silence_duration=0.30,
             activation_threshold=0.60,
         ),
         tools=[end_call],
