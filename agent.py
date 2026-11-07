@@ -16,7 +16,7 @@ from livekit.agents import (
 )
 from livekit.agents.inference import TTS as InferenceTTS, STT as InferenceSTT
 from livekit.agents.voice import Agent
-from livekit.agents.voice.room_io import RoomInputOptions
+from livekit.agents.voice.room_io import RoomOptions
 from livekit.plugins import openai, silero
 
 load_dotenv(override=True)
@@ -232,11 +232,10 @@ async def entrypoint(ctx: JobContext):
     ).strip()
 
     if not llm_api_key:
-        logger.error("CRITICAL: No OPENROUTER_API_KEY or OPENAI_API_KEY found in .env!")
+        logger.error("CRITICAL: No OPENROURAL_API_KEY or OPENAI_API_KEY found in .env!")
 
     session = AgentSession(
-        min_endpointing_delay=0.20,
-        max_endpointing_delay=0.60,
+        preemptive_generation=True,
     )
 
     call_ending = False
@@ -320,16 +319,16 @@ async def entrypoint(ctx: JobContext):
         elif role == "assistant":
             print(f"\n🤖 [{agent_display_name}]: {text}\n", flush=True)
 
-    room_input_opts = (
-        RoomInputOptions(participant_identity=target_participant.identity)
+    room_opts = (
+        RoomOptions(participant_identity=target_participant.identity)
         if target_participant is not None
-        else RoomInputOptions()
+        else RoomOptions()
     )
 
     await session.start(
         agent=agent,
         room=ctx.room,
-        room_input_options=room_input_opts,
+        room_options=room_opts,
     )
 
     # Watchdog de seguridad financiera: corta la llamada si supera max_call_duration (por defecto 180s)
