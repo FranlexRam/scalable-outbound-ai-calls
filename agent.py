@@ -33,7 +33,7 @@ DEFAULT_TTS_MODEL = "cartesia/sonic-2"
 
 async def _hangup_room(room_name: str) -> None:
     """Destruye la sala en LiveKit Cloud para forzar el corte SIP BYE inmediato en Twilio."""
-    if not room_name or room_name == "console":
+    if not room_name or room_name in ("console", "console-room", "mock_room"):
         return
     lk_url = os.environ.get("LIVEKIT_URL", "")
     lk_key = os.environ.get("LIVEKIT_API_KEY", "")
@@ -50,9 +50,26 @@ async def _hangup_room(room_name: str) -> None:
         await lk.aclose()
 
 
-async def _delayed_hangup(room_name: str, delay: float = 4.0) -> None:
+async def _terminate_call_session(
+    ctx: JobContext,
+    session: AgentSession,
+    delay: float = 3.5,
+) -> None:
+    """Espera a que termine de reproducirse la despedida, destruye la sala SIP/Cloud y apaga la sesión local."""
+    try:
+        session.input.set_audio_enabled(False)
+    except Exception:
+        pass
+
     await asyncio.sleep(delay)
-    await _hangup_room(room_name)
+    await _hangup_room(ctx.room.name)
+
+    try:
+        await session.aclose()
+    except Exception:
+        pass
+
+    ctx.shutdown(reason="Call terminated cleanly by end_call")
 
 
 async def _call_duration_watchdog(room_name: str, max_seconds: int) -> None:
@@ -123,7 +140,7 @@ async def entrypoint(ctx: JobContext):
             "3. ESCRITURA FONÉTICA: Escribe TODOS los números, porcentajes y horas en letras minúsculas exactamente como se pronuncian (ejemplo: escribe 'cincuenta por ciento' en lugar de '50%', 'diez de la mañana' en lugar de '10 am').\n"
             "4. MULETILLAS FLUIDAS AL INICIAR: Inicia tus respuestas con conectores naturales seguidos de coma como 'Claro, mira,', 'Ah, entiendo,', 'Sí, te cuento rapidito,', 'Bueno, fíjate que'. NUNCA pongas puntos suspensivos (...) en las primeras palabras para no retrasar el inicio de tu voz.\n"
             "5. DOSIFICACIÓN DE INFORMACIÓN: NUNCA sueltes todo el discurso de golpe. Habla en turnos muy breves de 1 sola oración (máximo 15 a 22 palabras) y termina con una pregunta corta y natural para escuchar al cliente.\n"
-            "6. FLUJO DESPUÉS DEL ALÓ Y CIERRE: Cuando el cliente responda a tu '¿Aló?', preséntate brevemente, menciona el motivo en una frase sencilla y pregúntale si tiene un minutito. Cuando la conversación termine y te despidas (o si te dicen número equivocado / no interesado), despídete amablemente y ejecuta la herramienta end_call."
+            "6. FLUJO DESPUÉS DEL ALÓ Y CIERRE: Cuando el cliente responda a tu '¿Aló?', preséntate brevemente, menciona el motivo en una frase sencilla y pregúntale si tiene un minutito. Cuando la conversación termine y te despidas (o si te dicen número equivocado / no interesado), di tu frase de despedida e invoca la herramienta end_call en ese mismo turno."
         )
     else:
         # 1. Identidad y contexto 100% en Inglés
@@ -149,7 +166,7 @@ async def entrypoint(ctx: JobContext):
             "3. PHONETIC SPELLING: Spell out ALL numbers, percentages, and times in lowercase words exactly as spoken (e.g., write 'fifty percent' instead of '50%', 'ten in the morning' instead of '10 am').\n"
             "4. FLUENT FILLERS AT START: Start responses with natural connectors followed by a comma like 'Yeah, so,', 'Oh, got it,', 'Sure, real quick,'. NEVER put ellipses (...) in the first few words so your voice starts immediately.\n"
             "5. PACING AND TURN LENGTH: NEVER deliver a long pitch all at once. Keep every turn to 1 short sentence (15 to 22 words max) and end with a natural, low-pressure question.\n"
-            "6. POST-HELLO FLOW AND HANGUP: Once the person replies to your initial 'Hello?', introduce yourself briefly, mention the main reason for calling in one simple phrase, and ask if caught them at a good time. When the conversation concludes and you say goodbye, call the end_call tool."
+            "6. POST-HELLO FLOW AND HANGUP: Once the person replies to your initial 'Hello?', introduce yourself briefly, mention the main reason for calling in one simple phrase, and ask if caught them at a good time. When the conversation concludes and you say goodbye, invoke the end_call tool in that same turn."
         )
 
     logger.info(
@@ -176,7 +193,10 @@ async def entrypoint(ctx: JobContext):
     tts = InferenceTTS(**tts_kwargs)
 
     # Detectar si estamos en modo consola local (gratis) o en sala LiveKit (SIP / WebRTC)
-    is_console_mode = ctx.room.name in ("console", "mock_room", "") or len(sys_argv := os.sys.argv) > 1 and "console" in sys_argv
+    is_console_mode = (
+        ctx.room.name in ("console", "console-room", "mock_room", "")
+        or (len(sys_argv := os.sys.argv) > 1 and "console" in sys_argv)
+    )
     target_participant = None
 
     if not is_console_mode:
@@ -204,16 +224,27 @@ async def entrypoint(ctx: JobContext):
     if not llm_api_key:
         logger.error("CRITICAL: No OPENROUTER_API_KEY or OPENAI_API_KEY found in .env!")
 
+    session = AgentSession(
+        min_endpointing_delay=0.25,
+        max_endpointing_delay=1.2,
+    )
+
+    call_ending = False
+
     @llm.function_tool(
         description=(
-            "Call this tool to hang up and end the phone call ONLY AFTER you have said your final goodbye "
-            "(for example, after confirming an appointment and saying goodbye, or when the user says wrong number / not interested)."
+            "End and hang up the call. Invoke this tool in the exact same turn where you say your final goodbye "
+            "(when an appointment is confirmed and you say goodbye, or when the user is not interested / wrong number)."
         )
     )
-    async def end_call() -> str:
-        logger.info("📴 Agent triggered end_call tool — scheduling room hangup in 4 seconds…")
-        asyncio.create_task(_delayed_hangup(ctx.room.name, delay=4.0))
-        return "Call termination scheduled."
+    async def end_call() -> None:
+        nonlocal call_ending
+        if call_ending:
+            return None
+        call_ending = True
+        logger.info("📴 Agent triggered end_call tool — hanging up after goodbye finishes…")
+        asyncio.create_task(_terminate_call_session(ctx, session, delay=3.5))
+        return None
 
     agent = Agent(
         instructions=agent_instructions,
@@ -230,11 +261,6 @@ async def entrypoint(ctx: JobContext):
             activation_threshold=0.60,
         ),
         tools=[end_call],
-    )
-
-    session = AgentSession(
-        min_endpointing_delay=0.25,
-        max_endpointing_delay=1.2,
     )
 
     last_metrics: dict = {"eou_ms": 0.0, "llm_ttft_ms": 0.0, "tts_ttfb_ms": 0.0}
@@ -300,12 +326,18 @@ async def entrypoint(ctx: JobContext):
     max_duration = int(metadata.get("max_call_duration", os.environ.get("MAX_CALL_DURATION_SECONDS", "180")))
     watchdog_task = asyncio.create_task(_call_duration_watchdog(ctx.room.name, max_duration))
 
+    async def _on_shutdown_cleanup() -> None:
+        watchdog_task.cancel()
+        await _hangup_room(ctx.room.name)
+
+    ctx.add_shutdown_callback(_on_shutdown_cleanup)
+
     # Si el participante cuelga desde su teléfono o navegador, destruir la sala inmediatamente
     @ctx.room.on("participant_disconnected")
     def on_participant_disconnected(participant):
         if target_participant and participant.identity == target_participant.identity:
             logger.info("📴 Participant %s disconnected — destroying room immediately.", participant.identity)
-            asyncio.create_task(_hangup_room(ctx.room.name))
+            asyncio.create_task(_terminate_call_session(ctx, session, delay=0.1))
 
     # Handshake telefónico en 2 fases: primero confirmar línea antes de lanzar el pitch
     if language == "es":
