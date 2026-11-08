@@ -10,6 +10,7 @@ from livekit.agents import (
     AgentSession,
     AutoSubscribe,
     JobContext,
+    JobProcess,
     WorkerOptions,
     cli,
     llm,
@@ -18,6 +19,12 @@ from livekit.agents.inference import TTS as InferenceTTS, STT as InferenceSTT
 from livekit.agents.voice import Agent
 from livekit.agents.voice.room_io import RoomOptions
 from livekit.plugins import openai, silero
+
+# Pre-importar async_toolset para evitar el bloqueo de 159ms en el Event Loop al iniciar sesión
+try:
+    import livekit.agents.llm.async_toolset  # noqa: F401
+except ImportError:
+    pass
 
 try:
     from livekit.agents.voice.agent_session import TurnHandlingOptions
@@ -34,6 +41,14 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 AGENT_NAME = "outbound-agent"
 SIP_TRUNK_ID = os.environ.get("LIVEKIT_SIP_TRUNK_ID", "")
 DEFAULT_TTS_MODEL = "cartesia/sonic-2"
+
+
+def prewarm(proc: JobProcess) -> None:
+    """Precalienta recursos pesados (Silero VAD y toolsets) en RAM antes de que entre la llamada."""
+    proc.userdata["vad"] = silero.VAD.load(
+        min_silence_duration=0.30,
+        activation_threshold=0.60,
+    )
 
 
 async def _hangup_room(room_name: str) -> None:
@@ -282,6 +297,11 @@ async def entrypoint(ctx: JobContext):
         asyncio.create_task(_terminate_call_session(ctx, session, delay=5.5))
         return None
 
+    vad_instance = ctx.proc.userdata.get("vad") or silero.VAD.load(
+        min_silence_duration=0.30,
+        activation_threshold=0.60,
+    )
+
     agent = Agent(
         instructions=agent_instructions,
         stt=stt,
@@ -292,10 +312,7 @@ async def entrypoint(ctx: JobContext):
             temperature=0.6,
         ),
         tts=tts,
-        vad=silero.VAD.load(
-            min_silence_duration=0.30,
-            activation_threshold=0.60,
-        ),
+        vad=vad_instance,
         tools=[end_call],
     )
 
@@ -424,6 +441,7 @@ if __name__ == "__main__":
     cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
+            prewarm_fnc=prewarm,
             agent_name=AGENT_NAME,
         )
     )
