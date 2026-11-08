@@ -1,7 +1,9 @@
 import asyncio
+from datetime import datetime
 import json
 import logging
 import os
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from livekit import api
@@ -41,6 +43,36 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 AGENT_NAME = "outbound-agent"
 SIP_TRUNK_ID = os.environ.get("LIVEKIT_SIP_TRUNK_ID", "")
 DEFAULT_TTS_MODEL = "cartesia/sonic-2"
+
+DAYS_ES = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+MONTHS_ES = [
+    "enero", "febrero", "marzo", "abril", "mayo", "junio",
+    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+]
+
+
+def _get_temporal_context(language: str) -> str:
+    """Calcula la fecha, día y hora actual exacta (America/Caracas) como contexto interno silencioso."""
+    now = datetime.now(ZoneInfo("America/Caracas"))
+    if language == "es":
+        day_name = DAYS_ES[now.weekday()]
+        month_name = MONTHS_ES[now.month - 1]
+        period = (
+            "de la mañana"
+            if now.hour < 12
+            else ("de la tarde" if now.hour < 19 else "de la noche")
+        )
+        hour_12 = now.hour % 12 or 12
+        return (
+            f"CONCIENCIA TEMPORAL INTERNA (PROHIBIDO mencionar zonas horarias o países): "
+            f"Ahora mismo es {day_name} {now.day} de {month_name} de {now.year}, {hour_12}:{now.minute:02d} {period}. "
+            "Úsalo silenciosamente para saludar según la hora actual y calcular fechas reales al agendar ('hoy', 'mañana', 'este viernes')."
+        )
+    return (
+        f"INTERNAL TIME AWARENESS (NEVER mention timezones or countries out loud): "
+        f"Right now it is {now.strftime('%A, %B %d, %Y, %I:%M %p')}. "
+        "Use this silently to greet appropriately and resolve relative dates ('today', 'tomorrow', 'this Friday') when booking."
+    )
 
 
 def prewarm(proc: JobProcess) -> None:
@@ -131,10 +163,9 @@ async def entrypoint(ctx: JobContext):
     agent_instructions: str = metadata.get(
         "agent_instructions",
         (
-            "Eres asesora de atención al cliente de Zen Spa. Cuando el cliente confirme que es él después del aló, "
-            "salúdalo con calma, dile que lo llamas rapidito de Zen Spa para regalarle un cincuenta por ciento de descuento "
-            "en depilación láser por ser cliente de la casa, y pregúntale si tiene un minutito. "
-            "Si acepta agendar la valoración gratuita, pregúntale qué día de la semana le queda más cómodo, en la mañana o en la tarde."
+            "Eres asesora de Zen Spa. Cuando el cliente confirme que es él después del aló, "
+            "dile que lo llamas rapidito de Zen Spa para regalarle un cincuenta por ciento de descuento "
+            "en depilación láser con valoración gratuita esta semana, y pregúntale si tiene un minutito."
         ),
     )
     agent_display_name: str = metadata.get("agent_name", "Daniela")
@@ -146,57 +177,49 @@ async def entrypoint(ctx: JobContext):
         "Cliente frecuente de Zen Spa. Beneficio de cincuenta por ciento de descuento en paquetes de depilación láser definitiva.",
     )
 
+    temporal_context = _get_temporal_context(language)
+
     if language == "es":
-        # 1. Identidad y contexto 100% en Español
-        agent_instructions = f"Tu identidad: Eres {agent_display_name}.\n\n" + agent_instructions
+        agent_instructions = (
+            f"Tu identidad: Eres {agent_display_name}, especialista senior en ventas y agendamiento telefónico.\n"
+            f"{temporal_context}\n\n"
+            f"OBJETIVO DEL NEGOCIO:\n{agent_instructions}"
+        )
 
         if contact_name:
-            agent_instructions += (
-                f"\n\nLa persona a la que llamas se llama {contact_name}. "
-                "Trátala de tú con cercanía, pero no repitas su nombre en todas las frases."
-            )
+            agent_instructions += f"\nCliente en línea: {contact_name} (trátalo de tú con calidez, sin repetir su nombre en cada turno)."
 
         if personalization_context:
-            agent_instructions += (
-                "\n\nContexto sobre la llamada y el cliente:\n"
-                + personalization_context
-            )
+            agent_instructions += f"\nContexto del cliente: {personalization_context}"
 
-        # 2. Motor de Naturalidad Fonética y Conversacional (Español)
         agent_instructions += (
-            "\n\nREGLAS ESTRICTAS DE REALISMO HUMANO Y FONÉTICA (OBLIGATORIO):\n"
-            "1. IDIOMA Y TONO: Habla siempre en español neutro latinoamericano, con tono cálido, relajado y espontáneo, como una persona real llamando desde su oficina. Jamás suenes a locutor comercial.\n"
-            "2. PROHIBIDO SIGNOS DE EXCLAMACIÓN: NUNCA uses signos de admiración (¡ !). El motor de voz los exagera y suena robótico. Usa únicamente puntos, comas, puntos suspensivos (...) y signos de interrogación (?).\n"
-            "3. ESCRITURA FONÉTICA: Escribe TODOS los números, porcentajes y horas en letras minúsculas exactamente como se pronuncian (ejemplo: escribe 'cincuenta por ciento' en lugar de '50%', 'diez de la mañana' en lugar de '10 am').\n"
-            "4. MULETILLAS FLUIDAS AL INICIAR: Inicia tus respuestas con conectores naturales seguidos de coma como 'Claro, mira,', 'Ah, entiendo,', 'Sí, te cuento rapidito,', 'Bueno, fíjate que'. NUNCA pongas puntos suspensivos (...) en las primeras palabras para no retrasar el inicio de tu voz.\n"
-            "5. DOSIFICACIÓN DE INFORMACIÓN: NUNCA sueltes todo el discurso de golpe. Habla en turnos muy breves de 1 sola oración (máximo 15 a 22 palabras) y termina con una pregunta corta y natural para escuchar al cliente.\n"
-            "6. FLUJO DESPUÉS DEL ALÓ Y CIERRE: Cuando el cliente responda a tu '¿Aló?', preséntate brevemente, menciona el motivo en una frase sencilla y pregúntale si tiene un minutito. Cuando la conversación termine y te despidas (o si te dicen número equivocado / no interesado), di tu frase de despedida e invoca la herramienta end_call en ese mismo turno."
+            "\n\nREGLAS DE ORO DE VENTAS TELEFÓNICAS Y VOZ (OBLIGATORIO):\n"
+            "1. CLIENTE OCUPADO (MÁXIMO 16 PALABRAS): Quien contesta está ocupado. Responde SIEMPRE en 1 sola oración corta y directa (12 a 18 palabras máximo) cerrando con una pregunta breve.\n"
+            "2. CIERRE DE AGENDA EN VIVO: NUNCA digas 'luego reviso la agenda y te escribo' ni 'te confirmo la hora por mensaje'. Tú tienes disponibilidad en vivo: cuando el cliente elija un día o turno (mañana/tarde), propón inmediatamente dos horas concretas (ej: '¿Te queda mejor a las diez o a las once de la mañana?').\n"
+            "3. MANEJO DE OBJECIONES RÁPIDO: Si pregunta de qué trata o si duele/cuesta, responde el beneficio clave en menos de 10 palabras y retoma el cierre con doble opción de horario.\n"
+            "4. NATURALIDAD Y FONÉTICA TTS: Español neutro latinoamericano, cálido y relajado. PROHIBIDO usar signos de exclamación (¡ !). Escribe TODOS los números, porcentajes y horas en letras minúsculas ('cincuenta por ciento', 'cuatro de la tarde'). Inicia con conectores cortos seguidos de coma ('Claro, mira,', 'Ah, entiendo,', 'Perfecto,') sin puntos suspensivos al inicio.\n"
+            "5. CIERRE Y CORTE (end_call): En cuanto el cliente confirme la hora exacta (o si dice que no le interesa / está muy ocupado / número equivocado), confirma día y hora en una frase corta, despídete amablemente e invoca la herramienta end_call en ese mismo turno."
         )
     else:
-        # 1. Identidad y contexto 100% en Inglés
-        agent_instructions = f"Your identity: You are {agent_display_name}.\n\n" + agent_instructions
+        agent_instructions = (
+            f"Your identity: You are {agent_display_name}, a senior outbound sales and appointment specialist.\n"
+            f"{temporal_context}\n\n"
+            f"BUSINESS OBJECTIVE:\n{agent_instructions}"
+        )
 
         if contact_name:
-            agent_instructions += (
-                f"\n\nThe person you are calling is named {contact_name}. "
-                "Be warm and conversational, but do not overuse their name in every sentence."
-            )
+            agent_instructions += f"\nProspect on the line: {contact_name} (be warm and natural, do not overuse their name)."
 
         if personalization_context:
-            agent_instructions += (
-                "\n\nAdditional context about the call and the person:\n"
-                + personalization_context
-            )
+            agent_instructions += f"\nProspect context: {personalization_context}"
 
-        # 2. Motor de Naturalidad Fonética y Conversacional (Inglés)
         agent_instructions += (
-            "\n\nSTRICT HUMAN REALISM AND PHONETIC RULES (MANDATORY):\n"
-            "1. TONE AND DELIVERY: Speak in a warm, relaxed, spontaneous tone, like a real person calling from a quiet office. Never sound like a scripted telemarketer or radio announcer.\n"
-            "2. NO EXCLAMATION MARKS: NEVER use exclamation marks (!). The TTS engine over-acts them and sounds robotic. Use only periods, commas, ellipses (...), and question marks (?).\n"
-            "3. PHONETIC SPELLING: Spell out ALL numbers, percentages, and times in lowercase words exactly as spoken (e.g., write 'fifty percent' instead of '50%', 'ten in the morning' instead of '10 am').\n"
-            "4. FLUENT FILLERS AT START: Start responses with natural connectors followed by a comma like 'Yeah, so,', 'Oh, got it,', 'Sure, real quick,'. NEVER put ellipses (...) in the first few words so your voice starts immediately.\n"
-            "5. PACING AND TURN LENGTH: NEVER deliver a long pitch all at once. Keep every turn to 1 short sentence (15 to 22 words max) and end with a natural, low-pressure question.\n"
-            "6. POST-HELLO FLOW AND HANGUP: Once the person replies to your initial 'Hello?', introduce yourself briefly, mention the main reason for calling in one simple phrase, and ask if caught them at a good time. When the conversation concludes and you say goodbye, invoke the end_call tool in that same turn."
+            "\n\nMANDATORY OUTBOUND SALES & VOICE RULES:\n"
+            "1. BUSY PROSPECT (MAX 16 WORDS): The person is busy. ALWAYS reply in 1 ultra-concise sentence (12 to 18 words max) ending with a quick question.\n"
+            "2. LIVE CALENDAR CLOSING: NEVER say 'I will check the schedule and text you later'. You control the schedule live: as soon as they pick a day or part of day, immediately offer two concrete times (e.g., 'Does ten in the morning or two in the afternoon work better?').\n"
+            "3. FAST OBJECTION HANDLING: Answer any question in under 10 words focusing on value, then immediately pivot back to a two-option time close.\n"
+            "4. TTS PHONETICS & TONE: Warm, relaxed office tone. NEVER use exclamation marks (!). Spell out ALL numbers, percentages, and times in lowercase words ('fifty percent', 'four in the afternoon'). Start with short fillers followed by a comma ('Sure, so,', 'Oh, got it,') with no ellipses at the start.\n"
+            "5. HANGUP (end_call): Once the exact day and time are confirmed (or if not interested / busy / wrong number), confirm the slot in one brief phrase, say a warm goodbye, and invoke the end_call tool in that exact same turn."
         )
 
     logger.info(
@@ -261,7 +284,7 @@ async def entrypoint(ctx: JobContext):
                 turn_handling=TurnHandlingOptions(
                     endpointing={
                         "mode": "dynamic",
-                        "min_delay": 0.20,
+                        "min_delay": 0.25,
                         "max_delay": 0.60,
                     },
                     preemptive_generation=True,
@@ -269,13 +292,13 @@ async def entrypoint(ctx: JobContext):
             )
         except Exception:
             session = AgentSession(
-                min_endpointing_delay=0.20,
+                min_endpointing_delay=0.25,
                 max_endpointing_delay=0.60,
                 preemptive_generation=True,
             )
     else:
         session = AgentSession(
-            min_endpointing_delay=0.20,
+            min_endpointing_delay=0.25,
             max_endpointing_delay=0.60,
             preemptive_generation=True,
         )
