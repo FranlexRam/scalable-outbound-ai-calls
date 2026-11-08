@@ -19,6 +19,11 @@ from livekit.agents.voice import Agent
 from livekit.agents.voice.room_io import RoomOptions
 from livekit.plugins import openai, silero
 
+try:
+    from livekit.agents.voice.agent_session import TurnHandlingOptions
+except ImportError:
+    TurnHandlingOptions = None
+
 load_dotenv(override=True)
 
 logger = logging.getLogger("outbound-agent")
@@ -232,11 +237,33 @@ async def entrypoint(ctx: JobContext):
     ).strip()
 
     if not llm_api_key:
-        logger.error("CRITICAL: No OPENROURAL_API_KEY or OPENAI_API_KEY found in .env!")
+        logger.error("CRITICAL: No OPENROUTER_API_KEY or OPENAI_API_KEY found in .env!")
 
-    session = AgentSession(
-        preemptive_generation=True,
-    )
+    session: AgentSession
+    if TurnHandlingOptions is not None:
+        try:
+            session = AgentSession(
+                turn_handling=TurnHandlingOptions(
+                    endpointing={
+                        "mode": "dynamic",
+                        "min_delay": 0.20,
+                        "max_delay": 0.60,
+                    },
+                    preemptive_generation=True,
+                ),
+            )
+        except Exception:
+            session = AgentSession(
+                min_endpointing_delay=0.20,
+                max_endpointing_delay=0.60,
+                preemptive_generation=True,
+            )
+    else:
+        session = AgentSession(
+            min_endpointing_delay=0.20,
+            max_endpointing_delay=0.60,
+            preemptive_generation=True,
+        )
 
     call_ending = False
 
