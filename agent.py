@@ -17,7 +17,11 @@ from livekit.agents import (
     cli,
     llm,
 )
-from livekit.agents.inference import TTS as InferenceTTS, STT as InferenceSTT
+from livekit.agents.inference import (
+    LLM as InferenceLLM,
+    STT as InferenceSTT,
+    TTS as InferenceTTS,
+)
 from livekit.agents.voice import Agent
 from livekit.agents.voice.room_io import RoomOptions
 from livekit.plugins import openai, silero
@@ -43,6 +47,8 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 AGENT_NAME = "outbound-agent"
 SIP_TRUNK_ID = os.environ.get("LIVEKIT_SIP_TRUNK_ID", "")
 DEFAULT_TTS_MODEL = "cartesia/sonic-2"
+DEFAULT_LIVEKIT_LLM_MODEL = os.environ.get("LIVEKIT_LLM_MODEL", "openai/gpt-4o-mini")
+DEFAULT_OPENROUTER_LLM_MODEL = os.environ.get("OPENROUTER_LLM_MODEL", "anthropic/claude-haiku-5.5")
 
 DAYS_ES = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
 MONTHS_ES = [
@@ -73,6 +79,72 @@ def _get_temporal_context(language: str) -> str:
         f"Right now it is {now.strftime('%A, %B %d, %Y, %I:%M %p')}. "
         "Use this silently to greet appropriately and resolve relative dates ('today', 'tomorrow', 'this Friday') when booking."
     )
+
+
+def _build_llm() -> llm.LLM:
+    """Construye el motor LLM principal en LiveKit Inference (Virginia) con fallback automático a OpenRouter (ordenado por menor latencia)."""
+    llm_api_key = (
+        os.environ.get("OPENROUTER_API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+        or ""
+    ).strip()
+
+    primary_llm: llm.LLM | None = None
+    if os.environ.get("USE_LIVEKIT_LLM", "1") != "0":
+        try:
+            primary_llm = InferenceLLM(
+                model=DEFAULT_LIVEKIT_LLM_MODEL,
+                extra_kwargs={"temperature": 0.6},
+            )
+        except TypeError:
+            try:
+                primary_llm = InferenceLLM(model=DEFAULT_LIVEKIT_LLM_MODEL)
+            except Exception as exc:
+                logger.warning("Could not initialize LiveKit InferenceLLM: %s", exc)
+        except Exception as exc:
+            logger.warning("Could not initialize LiveKit InferenceLLM: %s", exc)
+
+    fallback_llm: llm.LLM | None = None
+    if llm_api_key:
+        try:
+            fallback_llm = openai.LLM(
+                model=DEFAULT_OPENROUTER_LLM_MODEL,
+                base_url="https://openrouter.ai/api/v1",
+                api_key=llm_api_key,
+                temperature=0.6,
+                extra_body={"provider": {"sort": "latency"}},
+            )
+        except TypeError:
+            fallback_llm = openai.LLM(
+                model=DEFAULT_OPENROUTER_LLM_MODEL,
+                base_url="https://openrouter.ai/api/v1",
+                api_key=llm_api_key,
+                temperature=0.6,
+            )
+
+    if primary_llm is not None and fallback_llm is not None:
+        if hasattr(llm, "FallbackAdapter"):
+            try:
+                logger.info(
+                    "🧠 Dual LLM Engine ready: Primary='%s' (LiveKit Virginia) | Fallback='%s' (OpenRouter Latency-Sorted)",
+                    DEFAULT_LIVEKIT_LLM_MODEL,
+                    DEFAULT_OPENROUTER_LLM_MODEL,
+                )
+                return llm.FallbackAdapter(llms=[primary_llm, fallback_llm])
+            except Exception as exc:
+                logger.debug("FallbackAdapter note: %s — using primary LLM directly", exc)
+        logger.info("🧠 Primary LLM Engine active: '%s' (LiveKit Virginia)", DEFAULT_LIVEKIT_LLM_MODEL)
+        return primary_llm
+
+    if primary_llm is not None:
+        logger.info("🧠 Primary LLM Engine active: '%s' (LiveKit Virginia)", DEFAULT_LIVEKIT_LLM_MODEL)
+        return primary_llm
+
+    if fallback_llm is not None:
+        logger.info("🧠 Fallback LLM Engine active: '%s' (OpenRouter Latency-Sorted)", DEFAULT_OPENROUTER_LLM_MODEL)
+        return fallback_llm
+
+    raise RuntimeError("CRITICAL: Neither LiveKit InferenceLLM nor OpenRouter LLM could be initialized!")
 
 
 def prewarm(proc: JobProcess) -> None:
@@ -268,14 +340,7 @@ async def entrypoint(ctx: JobContext):
     else:
         stt = InferenceSTT(model="deepgram/nova-3", language="en")
 
-    llm_api_key = (
-        os.environ.get("OPENROUTER_API_KEY")
-        or os.environ.get("OPENAI_API_KEY")
-        or ""
-    ).strip()
-
-    if not llm_api_key:
-        logger.error("CRITICAL: No OPENROUTER_API_KEY or OPENAI_API_KEY found in .env!")
+    llm_engine = _build_llm()
 
     session: AgentSession
     if TurnHandlingOptions is not None:
@@ -328,12 +393,7 @@ async def entrypoint(ctx: JobContext):
     agent = Agent(
         instructions=agent_instructions,
         stt=stt,
-        llm=openai.LLM(
-            model="anthropic/claude-haiku-5.5",
-            base_url="https://openrouter.ai/api/v1",
-            api_key=llm_api_key,
-            temperature=0.6,
-        ),
+        llm=llm_engine,
         tts=tts,
         vad=vad_instance,
         tools=[end_call],
