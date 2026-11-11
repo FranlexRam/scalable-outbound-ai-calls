@@ -18,7 +18,7 @@ from livekit import api
 from livekit.agents.inference import TTS as InferenceTTS
 from pydantic import BaseModel, field_validator
 
-load_dotenv()
+load_dotenv(override=True)
 
 app = FastAPI(title="Outbound Calling API")
 
@@ -451,12 +451,17 @@ async def voice_preview(
         voice = voice_id[idx + 1:]
         model = voice_id[:idx]
 
+    if model.startswith("deepgram/") and voice:
+        voice = re.sub(r"-(es|en)$", "", voice)
+    elif model.startswith("rime/") and voice and voice.lower() == "serena":
+        model = "rime/arcana"
+
     try:
         async with aiohttp.ClientSession() as http_session:
             tts_kwargs: Dict[str, Any] = {"model": model, "http_session": http_session}
             if voice:
                 tts_kwargs["voice"] = voice
-            if not model.startswith("deepgram/"):
+            if not model.startswith("rime/"):
                 tts_kwargs["language"] = language
 
             tts = InferenceTTS(**tts_kwargs)

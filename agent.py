@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 import json
 import logging
 import os
+import re
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -74,6 +75,93 @@ WEEKDAY_MAP = {
     "sabado": 5, "sábado": 5, "saturday": 5,
     "domingo": 6, "sunday": 6,
 }
+
+PHONE_WORD_TO_DIGITS = {
+    "cero": "0", "zero": "0", "oh": "0",
+    "uno": "1", "un": "1", "una": "1", "one": "1",
+    "dos": "2", "two": "2",
+    "tres": "3", "three": "3",
+    "cuatro": "4", "four": "4",
+    "cinco": "5", "five": "5",
+    "seis": "6", "six": "6",
+    "siete": "7", "seven": "7",
+    "ocho": "8", "eight": "8",
+    "nueve": "9", "nine": "9",
+    "diez": "10", "ten": "10",
+    "once": "11", "eleven": "11",
+    "doce": "12", "twelve": "12",
+    "trece": "13", "thirteen": "13",
+    "catorce": "14", "fourteen": "14",
+    "quince": "15", "fifteen": "15",
+    "dieciseis": "16", "dieciséis": "16", "sixteen": "16",
+    "diecisiete": "17", "seventeen": "17",
+    "dieciocho": "18", "eighteen": "18",
+    "diecinueve": "19", "nineteen": "19",
+    "veinte": "20", "twenty": "20",
+    "veintiuno": "21", "veintiun": "21", "veintiún": "21",
+    "veintidos": "22", "veintidós": "22",
+    "veintitres": "23", "veintitrés": "23",
+    "veinticuatro": "24",
+    "veinticinco": "25",
+    "veintiseis": "26", "veintiséis": "26",
+    "veintisiete": "27",
+    "veintiocho": "28",
+    "veintinueve": "29",
+}
+PHONE_TENS_TO_INT = {
+    "treinta": 30, "thirty": 30,
+    "cuarenta": 40, "forty": 40,
+    "cincuenta": 50, "fifty": 50,
+    "sesenta": 60, "sixty": 60,
+    "setenta": 70, "seventy": 70,
+    "ochenta": 80, "eighty": 80,
+    "noventa": 90, "ninety": 90,
+}
+PHONE_UNITS_TO_INT = {
+    "uno": 1, "un": 1, "una": 1, "one": 1,
+    "dos": 2, "two": 2,
+    "tres": 3, "three": 3,
+    "cuatro": 4, "four": 4,
+    "cinco": 5, "five": 5,
+    "seis": 6, "six": 6,
+    "siete": 7, "seven": 7,
+    "ocho": 8, "eight": 8,
+    "nueve": 9, "nine": 9,
+}
+
+
+def _extract_phone_digits_from_text(text: str) -> str:
+    """Extrae de forma 100% determinista en Python los dígitos de un teléfono dictado en palabras o números."""
+    lower = text.lower()
+    if "arroba" in lower or "@" in lower or "gmail" in lower or "hotmail" in lower or "outlook" in lower:
+        return ""
+    tokens = re.findall(r"[a-záéíóúñ]+|\d+", lower)
+    result: list[str] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok.isdigit():
+            result.append(tok)
+            i += 1
+            continue
+        if tok in PHONE_TENS_TO_INT:
+            tens_val = PHONE_TENS_TO_INT[tok]
+            if i + 2 < len(tokens) and tokens[i + 1] == "y" and tokens[i + 2] in PHONE_UNITS_TO_INT:
+                result.append(str(tens_val + PHONE_UNITS_TO_INT[tokens[i + 2]]))
+                i += 3
+                continue
+            if i + 1 < len(tokens) and tokens[i + 1] in PHONE_UNITS_TO_INT:
+                result.append(str(tens_val + PHONE_UNITS_TO_INT[tokens[i + 1]]))
+                i += 2
+                continue
+            result.append(str(tens_val))
+            i += 1
+            continue
+        if tok in PHONE_WORD_TO_DIGITS:
+            result.append(PHONE_WORD_TO_DIGITS[tok])
+        i += 1
+    digits = "".join(result)
+    return digits if 7 <= len(digits) <= 15 else ""
 
 
 def _format_date_phonetic(dt: datetime, language: str) -> str:
@@ -305,7 +393,11 @@ async def entrypoint(ctx: JobContext):
         ),
     )
     agent_display_name: str = metadata.get("agent_name", "Daniela")
-    voice_id: str | None = metadata.get("voice_id") or "cartesia/sonic-2:5c5ad5e7-1020-476b-8b91-fdcbe9cc313c"
+    voice_id: str | None = (
+        metadata.get("voice_id")
+        or os.environ.get("VOICE_ID")
+        or "cartesia/sonic-2:5c5ad5e7-1020-476b-8b91-fdcbe9cc313c"
+    )
     language: str = metadata.get("language") or "es"
     contact_name: str = metadata.get("contact_name", "Franlex")
     personalization_context: str = metadata.get(
@@ -355,7 +447,7 @@ async def entrypoint(ctx: JobContext):
             "      - PASO 4.2 (Rama Sí / Rama No del WhatsApp):\n"
             "        * Si el cliente dice que SÍ usa este mismo número: pídele ahora su correo electrónico ('Perfecto, ¿y a qué correo electrónico te envío la confirmación?').\n"
             "        * Si el cliente dice que NO o que prefiere otro número: pregúntale primero '¿Cuál sería el mejor número telefónico para enviarte la confirmación por WhatsApp?'. Cuando te dé el número, confírmalo brevemente y ahí sí pídele su correo electrónico.\n"
-            "      - PASO 4.3 (Verificación obligatoria del Correo / Read-Back): Cuando el cliente te dicte su correo electrónico, NO invoques book_appointment todavía. Repítele el correo claramente (ej. 'Perfecto, verifico que tu correo sea franlex punto ramirez arroba gmail punto com, ¿está correcto?'). Si el cliente dice que está incorrecto o corrige algo, haz la corrección y vuelve a repetírselo para confirmar.\n"
+            "      - PASO 4.3 (Verificación obligatoria del Correo / Read-Back): Cuando el cliente te dicte su correo electrónico, NO invoques book_appointment todavía. Repítele el correo en palabras fonéticas (escribiendo 'punto' y 'arroba' en letras para tu voz, ej. 'Perfecto, verifico que tu correo sea franlex punto ramirez dos arroba gmail punto com, ¿está correcto?'). Si el cliente dice que está incorrecto o corrige algo, haz la corrección y vuelve a repetírselo en palabras para confirmar.\n"
             "    </phase>\n"
             "    <phase index=\"5\" name=\"registro_final_y_despedida_acorde_a_la_hora\">\n"
             f"      - ÚNICAMENTE cuando el cliente confirme que el correo repetido SÍ está correcto, invoca OBLIGATORIAMENTE la herramienta book_appointment y dile que al finalizar la llamada estará recibiendo la confirmación tanto por WhatsApp como por correo, deseándole que pase {current_farewell}.\n"
@@ -406,7 +498,7 @@ async def entrypoint(ctx: JobContext):
             "      - STEP 4.2 (WhatsApp Yes / No Branch):\n"
             "        * If they say YES to this same number: ask for their email address ('Perfect, and what email address should I send the confirmation to?').\n"
             "        * If they say NO or prefer another number: first ask 'What is the best phone number to send your WhatsApp confirmation to?'. Once they give the number, confirm it briefly and then ask for their email address.\n"
-            "      - STEP 4.3 (Mandatory Email Read-Back Loop): When the prospect gives their email address, DO NOT invoke book_appointment yet. Repeat the email back clearly and ask 'Is that email correct?'. If they say it is incorrect, apply the correction and repeat it back again for confirmation.\n"
+            "      - STEP 4.3 (Mandatory Email Read-Back Loop): When the prospect gives their email address, DO NOT invoke book_appointment yet. Repeat the email back clearly in spoken words (using 'dot' and 'at' for your voice) and ask 'Is that email correct?'. If they say it is incorrect, apply the correction and repeat it back again for confirmation.\n"
             "    </phase>\n"
             "    <phase index=\"5\" name=\"final_booking_and_time_aware_goodbye\">\n"
             f"      - ONLY after the prospect confirms that the repeated email is YES correct, MANDATORILY invoke the book_appointment tool and let them know that as soon as the call ends they will receive the confirmation via both WhatsApp and email, wishing them {current_farewell}.\n"
@@ -429,7 +521,7 @@ async def entrypoint(ctx: JobContext):
 
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
 
-    # Parsear "provider/model:voice-id" para inyectar language directamente en InferenceTTS
+    # Parsear "provider/model:voice-id" y normalizar parámetros según proveedor (Cartesia, Deepgram, Rime)
     model = voice_id if voice_id else DEFAULT_TTS_MODEL
     voice: str | None = None
     if voice_id and ":" in voice_id:
@@ -437,10 +529,15 @@ async def entrypoint(ctx: JobContext):
         voice = voice_id[idx + 1:]
         model = voice_id[:idx]
 
+    if model.startswith("deepgram/") and voice:
+        voice = re.sub(r"-(es|en)$", "", voice)
+    elif model.startswith("rime/") and voice and voice.lower() == "serena":
+        model = "rime/arcana"
+
     tts_kwargs: dict = {"model": model}
     if voice:
         tts_kwargs["voice"] = voice
-    if not model.startswith("deepgram/"):
+    if not model.startswith("rime/"):
         tts_kwargs["language"] = language
 
     tts = InferenceTTS(**tts_kwargs)
@@ -500,6 +597,7 @@ async def entrypoint(ctx: JobContext):
     booking_state: dict = {
         "last_user_text": "",
         "email_read_back_to_user": False,
+        "extracted_phone_digits": "",
     }
 
     @llm.function_tool(
@@ -621,15 +719,22 @@ async def entrypoint(ctx: JobContext):
                 )
             return (
                 f"ALTO - NO CIERRES LA LLAMADA TODAVÍA: El cliente acaba de dictar su correo ('{email}'). "
-                f"Según el protocolo obligatorio, primero debes repetirle textualmente el correo '{email}' y preguntarle: '¿Está correcto tu correo?'. "
+                f"Según el protocolo obligatorio, primero debes repetirle textualmente el correo '{email}' en palabras y preguntarle: '¿Está correcto tu correo?'. "
                 "Solo cuando el cliente te responda que sí, vuelve a invocar book_appointment."
             )
 
-        resolved_phone = (
-            phone_number
-            if ("mismo" in whatsapp_number.lower() or "same" in whatsapp_number.lower()) and phone_number
-            else whatsapp_number
-        )
+        if booking_state["extracted_phone_digits"]:
+            resolved_phone = booking_state["extracted_phone_digits"]
+            logger.info(
+                "📞 [PHONE PARSER] Deterministic Python phone applied: '%s' (LLM passed: '%s')",
+                resolved_phone,
+                whatsapp_number,
+            )
+        elif ("mismo" in whatsapp_number.lower() or "same" in whatsapp_number.lower()) and phone_number:
+            resolved_phone = phone_number
+        else:
+            resolved_phone = whatsapp_number
+
         booking_payload = {
             "client_name": contact_name or "Cliente",
             "appointment_date": appointment_date,
@@ -733,6 +838,10 @@ async def entrypoint(ctx: JobContext):
             text = " ".join(str(part) for part in text if part)
         if role == "user":
             booking_state["last_user_text"] = text
+            parsed_digits = _extract_phone_digits_from_text(text)
+            if parsed_digits:
+                booking_state["extracted_phone_digits"] = parsed_digits
+                logger.info("📞 [PHONE PARSER] Captured exact phone digits from user speech: %s", parsed_digits)
             print(f"\n👤 [{contact_name or 'Usuario'}]: {text}", flush=True)
         elif role == "assistant":
             clean_text = text.replace("functions.end_call", "").replace("end_call()", "").strip()
