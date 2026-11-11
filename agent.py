@@ -1,6 +1,5 @@
 import asyncio
-import calendar
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import logging
 import os
@@ -52,60 +51,76 @@ DEFAULT_LIVEKIT_LLM_MODEL = os.environ.get("LIVEKIT_LLM_MODEL", "openai/gpt-4o-m
 DEFAULT_OPENROUTER_LLM_MODEL = os.environ.get("OPENROUTER_LLM_MODEL", "anthropic/claude-haiku-5.5")
 
 DAYS_ES = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+DAYS_EN = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 MONTHS_ES = [
     "enero", "febrero", "marzo", "abril", "mayo", "junio",
     "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
 ]
+NUMBERS_ES = {
+    1: "uno", 2: "dos", 3: "tres", 4: "cuatro", 5: "cinco",
+    6: "seis", 7: "siete", 8: "ocho", 9: "nueve", 10: "diez",
+    11: "once", 12: "doce", 13: "trece", 14: "catorce", 15: "quince",
+    16: "dieciséis", 17: "diecisiete", 18: "dieciocho", 19: "diecinueve", 20: "veinte",
+    21: "veintiuno", 22: "veintidós", 23: "veintitrés", 24: "veinticuatro", 25: "veinticinco",
+    26: "veintiséis", 27: "veintisiete", 28: "veintiocho", 29: "veintinueve", 30: "treinta",
+    31: "treinta y uno",
+}
+WEEKDAY_MAP = {
+    "lunes": 0, "monday": 0,
+    "martes": 1, "tuesday": 1,
+    "miercoles": 2, "miércoles": 2, "wednesday": 2,
+    "jueves": 3, "thursday": 3,
+    "viernes": 4, "friday": 4,
+    "sabado": 5, "sábado": 5, "saturday": 5,
+    "domingo": 6, "sunday": 6,
+}
 
 
-def _build_three_month_calendar(now: datetime, language: str) -> str:
-    """Genera dinámicamente desde now() el calendario exacto del mes actual y los próximos 2 meses para conciencia temporal absoluta."""
-    cal = calendar.TextCalendar(calendar.MONDAY)
-    blocks: list[str] = []
-    year, month = now.year, now.month
-    for _ in range(3):
-        if language == "es":
-            month_title = f"{MONTHS_ES[month - 1].capitalize()} {year}"
-            lines = cal.formatmonth(year, month).strip().splitlines()
-            if len(lines) >= 2:
-                lines[0] = month_title
-                lines[1] = "Lu Ma Mi Ju Vi Sa Do"
-            blocks.append("\n".join(lines))
-        else:
-            blocks.append(cal.formatmonth(year, month).strip())
-        month += 1
-        if month > 12:
-            month = 1
-            year += 1
-    return "\n\n".join(blocks)
+def _format_date_phonetic(dt: datetime, language: str) -> str:
+    """Convierte un objeto datetime a texto fonético exacto ('miércoles dieciocho de noviembre')."""
+    if language == "es":
+        day_name = DAYS_ES[dt.weekday()]
+        day_word = NUMBERS_ES.get(dt.day, str(dt.day))
+        month_name = MONTHS_ES[dt.month - 1]
+        return f"{day_name} {day_word} de {month_name}"
+    return dt.strftime("%A, %B %d")
+
+
+def _get_time_of_day_phrases(language: str) -> tuple[str, str, str]:
+    """Devuelve (periodo, saludo, deseo_despedida) acordes a la hora exacta de Venezuela (America/Caracas)."""
+    now = datetime.now(ZoneInfo("America/Caracas"))
+    if language == "es":
+        if now.hour < 12:
+            return "de la mañana", "buenos días", "un feliz día"
+        if now.hour < 19:
+            return "de la tarde", "buenas tardes", "una feliz tarde"
+        return "de la noche", "buenas noches", "una feliz noche"
+    if now.hour < 12:
+        return "AM", "good morning", "a wonderful day"
+    if now.hour < 19:
+        return "PM", "good afternoon", "a wonderful afternoon"
+    return "PM", "good evening", "a wonderful evening"
 
 
 def _get_temporal_context(language: str) -> str:
-    """Calcula la fecha, día y hora actual exacta (America/Caracas) y el calendario completo desde now() sin límite de días."""
+    """Devuelve únicamente la fecha, día y hora actual exacta (America/Caracas) y el saludo correspondiente."""
     now = datetime.now(ZoneInfo("America/Caracas"))
-    cal_str = _build_three_month_calendar(now, language)
+    period, greeting_phrase, farewell_phrase = _get_time_of_day_phrases(language)
     if language == "es":
         day_name = DAYS_ES[now.weekday()]
+        day_word = NUMBERS_ES.get(now.day, str(now.day))
         month_name = MONTHS_ES[now.month - 1]
-        period = (
-            "de la mañana"
-            if now.hour < 12
-            else ("de la tarde" if now.hour < 19 else "de la noche")
-        )
         hour_12 = now.hour % 12 or 12
         return (
-            f"CONCIENCIA TEMPORAL INTERNA ABSOLUTA (PROHIBIDO mencionar zonas horarias o países en voz alta):\n"
-            f"- Fecha y hora actual (now): Hoy es {day_name} {now.day} de {month_name} de {now.year} "
-            f"(ISO: {now.strftime('%Y-%m-%d')}), y son las {hour_12}:{now.minute:02d} {period}.\n"
-            f"- Referencia exacta de calendario oficial desde hoy (útil para saber qué fecha cae cualquier día de esta semana, la próxima, o dentro de varias semanas/meses sin equivocarte jamás):\n"
-            f"{cal_str}"
+            f"Ahora mismo (now) es {day_name} {day_word} de {month_name} de {now.year} "
+            f"(ISO: {now.strftime('%Y-%m-%d')}), {hour_12}:{now.minute:02d} {period}. "
+            f"Saludo acorde a la hora actual: '{greeting_phrase}'. Despedida acorde a la hora actual: 'que pases {farewell_phrase}'. "
+            "PROHIBIDO calcular fechas mentalmente: usa SIEMPRE la herramienta check_availability cuando el cliente mencione cualquier día o semana."
         )
     return (
-        f"ABSOLUTE INTERNAL TIME AWARENESS (NEVER mention timezones or countries out loud):\n"
-        f"- Current date and time (now): Today is {now.strftime('%A, %B %d, %Y')} "
-        f"(ISO: {now.strftime('%Y-%m-%d')}), and the time is {now.strftime('%I:%M %p')}.\n"
-        f"- Official calendar reference starting from today (use this to know the exact date of any day this week, next week, or several weeks/months ahead with 100% accuracy):\n"
-        f"{cal_str}"
+        f"Right now (now) it is {now.strftime('%A, %B %d, %Y')} (ISO: {now.strftime('%Y-%m-%d')}), {now.strftime('%I:%M %p')}. "
+        f"Time-appropriate greeting: '{greeting_phrase}'. Time-appropriate farewell: 'have {farewell_phrase}'. "
+        "NEVER calculate dates mentally: ALWAYS use the check_availability tool whenever the prospect mentions any day or week."
     )
 
 
@@ -215,16 +230,17 @@ async def _hangup_room(room_name: str) -> None:
 async def _terminate_call_session(
     ctx: JobContext,
     session: AgentSession,
-    max_wait: float = 6.5,
+    initial_wait: float = 1.2,
+    max_wait: float = 18.0,
 ) -> None:
-    """Monitorea en tiempo real el fin de la locución de despedida y corta la llamada sin silencios muertos."""
+    """Monitorea en tiempo real el fin de la locución de despedida y corta la llamada sin cortar sílabas ni dejar silencios muertos."""
     try:
         session.input.set_audio_enabled(False)
     except Exception:
         pass
 
-    # Dar margen breve (0.9s) para que el TTS inicie el playout de la frase de despedida
-    await asyncio.sleep(0.9)
+    # Dar margen para que el TTS inicie el playout de la frase de despedida
+    await asyncio.sleep(initial_wait)
 
     loop = asyncio.get_event_loop()
     deadline = loop.time() + max_wait
@@ -243,7 +259,7 @@ async def _terminate_call_session(
             break
 
     # Pausa natural breve tras la última sílaba antes de colgar
-    await asyncio.sleep(0.6)
+    await asyncio.sleep(0.7)
     await _hangup_room(ctx.room.name)
 
     try:
@@ -298,6 +314,7 @@ async def entrypoint(ctx: JobContext):
     )
 
     temporal_context = _get_temporal_context(language)
+    _, current_greeting, current_farewell = _get_time_of_day_phrases(language)
     raw_business_instructions = agent_instructions.strip()
     raw_call_context = personalization_context.strip()
     client_label = contact_name.strip() if contact_name else ("Cliente" if language == "es" else "Prospect")
@@ -305,9 +322,10 @@ async def entrypoint(ctx: JobContext):
     if language == "es":
         agent_instructions = (
             "<runtime_data>\n"
-            f"  <temporal_awareness>\n{temporal_context}\n  </temporal_awareness>\n"
+            f"  <temporal_awareness>{temporal_context}</temporal_awareness>\n"
             "  <business_and_client_context>\n"
             f"    <client_name>{client_label}</client_name>\n"
+            f"    <client_phone>{phone_number or 'este mismo número'}</client_phone>\n"
             f"    <call_context>{raw_call_context}</call_context>\n"
             f"    <business_instructions>{raw_business_instructions}</business_instructions>\n"
             "  </business_and_client_context>\n"
@@ -315,30 +333,39 @@ async def entrypoint(ctx: JobContext):
             "<agent_system_manifest>\n"
             "  <identity>\n"
             f"    Eres {agent_display_name}, Senior Client Success Manager y especialista en ventas consultivas telefónicas. "
-            "Tu tono es cálido, empático, natural y ejecutivo. Tratas al cliente de tú con cercanía sin repetir su nombre en todos los turnos.\n"
+            "Tu tono es cálido, empático, natural y ejecutivo. Tratas al cliente de tú con cercanía sin repetir su nombre en cada turno.\n"
             "  </identity>\n\n"
             "  <execution_pipeline>\n"
             "    <phase index=\"1\" name=\"apertura_con_motivo_y_beneficio\">\n"
-            "      En cuanto el cliente confirme que es él después del 'Aló', NUNCA preguntes '¿tienes un minuto?' a secas sin dar contexto. "
-            "En 2 oraciones fluidas (máximo 28 palabras): saluda, menciona de dónde llamas, explica POR QUÉ lo llamas y cuál es su beneficio especial según <call_context> y <business_instructions>, y cierra preguntando suavemente si tiene medio minutito.\n"
+            f"      En cuanto el cliente confirme que es él después del 'Aló', saluda usando '{current_greeting}' (NUNCA digas 'buen día' si es de noche), "
+            "menciona de dónde llamas, explica POR QUÉ lo llamas y cuál es su beneficio especial según <call_context> y <business_instructions>, y cierra preguntando suavemente si tiene medio minutito.\n"
             "    </phase>\n"
             "    <phase index=\"2\" name=\"explicacion_de_valor_antes_de_horarios\">\n"
-            "      Cuando el cliente diga 'Sí, ok' o pregunte '¿De qué trata? / ¿Por qué me llamas?', NUNCA lances horarios de golpe en frío. "
-            "Primero explica en 1 oración clara (máximo 25 palabras) en qué consiste el beneficio o paso propuesto en <business_instructions> para que entienda el valor sin compromiso, y cierra preguntando qué día o semana le quedaría más cómodo.\n"
+            "      Cuando el cliente diga 'Sí, ok' o pregunte '¿De qué trata? / ¿Por qué me llamas?', NUNCA lances horarios en frío. "
+            "Primero explica en 1 oración clara (máximo 25 palabras) en qué consiste el beneficio o paso propuesto en <business_instructions> sin compromiso, y cierra preguntando qué día o semana le quedaría más cómodo.\n"
             "    </phase>\n"
-            "    <phase index=\"3\" name=\"negociacion_consultiva_de_agenda\">\n"
-            "      - Cuando el cliente indique qué día o semana prefiere, verifica la fecha exacta en <temporal_awareness> y guíalo proponiendo dos horas concretas (variando horas entre mañana y tarde).\n"
-            "      - Si el cliente propone otra hora específica razonable (ej. 'mejor a las diez' o 'a las once'), adáptate de inmediato como un asesor senior y acéptala sin negársela.\n"
-            "      - Si dice que no puede en los horarios sugeridos, JAMÁS des por perdida la llamada ni te despidas: empatiza ('Claro, te entiendo perfecto.') y pregúntale '¿Qué hora te queda mejor a ti?'.\n"
+            "    <phase index=\"3\" name=\"consulta_determinista_de_fechas_y_horarios\">\n"
+            "      - OBLIGATORIO: En cuanto el cliente mencione cualquier día o semana ('mañana', 'el jueves', 'el próximo viernes', 'la próxima semana'), invoca SIEMPRE la herramienta check_availability antes de responder. JAMÁS calcules fechas mentalmente.\n"
+            "      - PROHIBIDO recitar una lista larga de horarios: ofrece SOLO DOS opciones concretas primero (una en la mañana y una en la tarde, ej. 'nueve de la mañana o tres de la tarde').\n"
+            "      - Si el cliente pide otra hora, acéptala con flexibilidad. Si no puede en las horas sugeridas, empatiza y pregúntale '¿Qué hora te queda más cómoda a ti?'.\n"
             "    </phase>\n"
-            "    <phase index=\"4\" name=\"confirmacion_y_cierre\">\n"
-            "      ÚNICAMENTE cuando el día, fecha y hora exacta estén confirmados por el cliente, o cuando rechace explícitamente el servicio o la llamada ('no me interesa el servicio', 'estoy muy ocupado, adiós', 'número equivocado'), confirma el acuerdo en una frase breve, despídete amablemente y ejecuta la herramienta de colgar llamada en ese mismo turno.\n"
+            "    <phase index=\"4\" name=\"confirmacion_paso_a_paso_whatsapp_y_correo\">\n"
+            "      PROHIBIDO pedir WhatsApp y correo en la misma pregunta y PROHIBIDO colgar sin verificar los datos. Sigue este orden estricto de una pregunta a la vez:\n"
+            "      - PASO 4.1 (Confirmar WhatsApp): Apenas el cliente elija día y hora, dile que le reservas ese horario, explícale que la confirmación se envía tanto por WhatsApp como por correo electrónico, y pregúntale ÚNICAMENTE: '¿Te envío la confirmación por WhatsApp a este mismo número?'.\n"
+            "      - PASO 4.2 (Rama Sí / Rama No del WhatsApp):\n"
+            "        * Si el cliente dice que SÍ usa este mismo número: pídele ahora su correo electrónico ('Perfecto, ¿y a qué correo electrónico te envío la confirmación?').\n"
+            "        * Si el cliente dice que NO o que prefiere otro número: pregúntale primero '¿Cuál sería el mejor número telefónico para enviarte la confirmación por WhatsApp?'. Cuando te dé el número, confírmalo brevemente y ahí sí pídele su correo electrónico.\n"
+            "      - PASO 4.3 (Verificación obligatoria del Correo / Read-Back): Cuando el cliente te dicte su correo electrónico, NO invoques book_appointment todavía. Repítele el correo claramente (ej. 'Perfecto, verifico que tu correo sea franlex punto ramirez arroba gmail punto com, ¿está correcto?'). Si el cliente dice que está incorrecto o corrige algo, haz la corrección y vuelve a repetírselo para confirmar.\n"
+            "    </phase>\n"
+            "    <phase index=\"5\" name=\"registro_final_y_despedida_acorde_a_la_hora\">\n"
+            f"      - ÚNICAMENTE cuando el cliente confirme que el correo repetido SÍ está correcto, invoca OBLIGATORIAMENTE la herramienta book_appointment y dile que al finalizar la llamada estará recibiendo la confirmación tanto por WhatsApp como por correo, deseándole que pase {current_farewell}.\n"
+            f"      - Si en cualquier momento el cliente rechaza explícitamente el servicio o la llamada ('no me interesa el servicio', 'estoy ocupado, adiós', 'número equivocado'), despídete deseándole {current_farewell} e invoca end_call.\n"
             "    </phase>\n"
             "  </execution_pipeline>\n\n"
             "  <hard_constraints>\n"
-            "    - MICRO-APERTURA TTS: Inicia siempre tu respuesta con una micro-frase de 2 a 3 palabras cerrada con PUNTO SEGUIDO ('Claro, buen día.', 'Perfecto, mira.', 'Ah, te cuento.') antes de la idea principal para que tu voz suene al instante.\n"
-            "    - LONGITUD ADAPTATIVA: Usa hasta 28 palabras en las Fases 1 y 2 para que el cliente comprenda el motivo y valor; usa de 12 a 18 palabras en las Fases 3 y 4 para agendar con agilidad.\n"
-            "    - FONÉTICA ESTRICTA: Responde en un solo párrafo continuo sin saltos de línea. PROHIBIDO usar signos de exclamación (¡ !) o puntos suspensivos al inicio. Escribe TODOS los números, fechas, porcentajes y horas en letras minúsculas ('cincuenta por ciento', 'diecinueve de noviembre', 'diez de la mañana').\n"
+            f"    - MICRO-APERTURA TTS: Inicia siempre tu respuesta con una micro-frase de 2 a 3 palabras cerrada con PUNTO SEGUIDO ('Claro, {current_greeting}.', 'Perfecto, mira.', 'Claro, con gusto.') antes de la oración principal para acelerar tu voz.\n"
+            "    - UNA PREGUNTA POR TURNO: Nunca hagas dos preguntas distintas en el mismo turno.\n"
+            "    - FONÉTICA ESTRICTA: Un solo párrafo continuo sin saltos de línea. PROHIBIDO usar signos de exclamación (¡ !) o puntos suspensivos al inicio. Escribe TODOS los números, teléfonos, fechas, porcentajes y horas en letras minúsculas ('cincuenta por ciento', 'veinte de noviembre', 'nueve de la mañana').\n"
             "    - AISLAMIENTO DE HERRAMIENTAS: JAMÁS escribas ni pronuncies nombres de funciones o código en tu respuesta de texto.\n"
             "  </hard_constraints>\n"
             "</agent_system_manifest>"
@@ -346,9 +373,10 @@ async def entrypoint(ctx: JobContext):
     else:
         agent_instructions = (
             "<runtime_data>\n"
-            f"  <temporal_awareness>\n{temporal_context}\n  </temporal_awareness>\n"
+            f"  <temporal_awareness>{temporal_context}</temporal_awareness>\n"
             "  <business_and_client_context>\n"
             f"    <client_name>{client_label}</client_name>\n"
+            f"    <client_phone>{phone_number or 'this same number'}</client_phone>\n"
             f"    <call_context>{raw_call_context}</call_context>\n"
             f"    <business_instructions>{raw_business_instructions}</business_instructions>\n"
             "  </business_and_client_context>\n"
@@ -360,26 +388,35 @@ async def entrypoint(ctx: JobContext):
             "  </identity>\n\n"
             "  <execution_pipeline>\n"
             "    <phase index=\"1\" name=\"contextual_opening_with_reason_and_benefit\">\n"
-            "      As soon as the prospect confirms it is them after 'Hello?', NEVER ask 'do you have a minute?' without context. "
-            "In 2 smooth sentences (max 28 words): greet them, state where you are calling from, explain WHY you are calling and their specific benefit based on <call_context> and <business_instructions>, and softly ask if they have half a minute.\n"
+            f"      As soon as the prospect confirms it is them after 'Hello?', greet them using '{current_greeting}', "
+            "state where you are calling from, explain WHY you are calling and their specific benefit based on <call_context> and <business_instructions>, and softly ask if they have half a minute.\n"
             "    </phase>\n"
             "    <phase index=\"2\" name=\"value_explanation_before_scheduling\">\n"
             "      When the prospect says 'Sure / Okay' or asks 'What is this about? / Why is it free?', NEVER push time slots cold. "
-            "First explain in 1 clear sentence (max 25 words) how the benefit or next step in <business_instructions> works so they understand the value with no obligation, then ask what day or week works best for them.\n"
+            "First explain in 1 clear sentence (max 25 words) how the benefit or next step in <business_instructions> works with no obligation, then ask what day or week works best for them.\n"
             "    </phase>\n"
-            "    <phase index=\"3\" name=\"consultative_schedule_negotiation\">\n"
-            "      - Once the prospect mentions a preferred day or week, verify the exact date in <temporal_awareness> and guide them by offering two concrete times.\n"
-            "      - If the prospect suggests another reasonable time (e.g., 'ten am works better'), adapt immediately like a senior advisor and accept their slot.\n"
-            "      - If neither suggested time works, NEVER give up or end the call: empathize ('Got it, totally understand.') and ask 'What time works best for you?'.\n"
+            "    <phase index=\"3\" name=\"deterministic_date_lookup_and_negotiation\">\n"
+            "      - MANDATORY: Whenever the prospect mentions any day or relative week ('tomorrow', 'this Thursday', 'next Friday'), ALWAYS invoke the check_availability tool first. NEVER calculate dates mentally.\n"
+            "      - NEVER recite a long list of times: offer ONLY TWO concrete options first (one in the morning and one in the afternoon).\n"
+            "      - If the prospect suggests another time, accept it immediately. If neither works, empathize and ask 'What time works best for you?'.\n"
             "    </phase>\n"
-            "    <phase index=\"4\" name=\"confirmation_and_hangup\">\n"
-            "      ONLY when the exact day, date, and time are confirmed, or when the prospect explicitly rejects the service or call ('not interested in the service', 'too busy, goodbye', 'wrong number'), confirm the details in one warm sentence, say goodbye, and execute the hangup tool in that exact same turn.\n"
+            "    <phase index=\"4\" name=\"step_by_step_whatsapp_and_email_verification\">\n"
+            "      NEVER ask for WhatsApp and email in the same question, and NEVER hang up without verifying their email. Follow this strict one-question-at-a-time sequence:\n"
+            "      - STEP 4.1 (Confirm WhatsApp): Once day and time are agreed, tell them you are reserving that slot, explain that the confirmation is sent via both WhatsApp and email, and ask ONLY: 'Should I send the WhatsApp confirmation to this same phone number?'.\n"
+            "      - STEP 4.2 (WhatsApp Yes / No Branch):\n"
+            "        * If they say YES to this same number: ask for their email address ('Perfect, and what email address should I send the confirmation to?').\n"
+            "        * If they say NO or prefer another number: first ask 'What is the best phone number to send your WhatsApp confirmation to?'. Once they give the number, confirm it briefly and then ask for their email address.\n"
+            "      - STEP 4.3 (Mandatory Email Read-Back Loop): When the prospect gives their email address, DO NOT invoke book_appointment yet. Repeat the email back clearly and ask 'Is that email correct?'. If they say it is incorrect, apply the correction and repeat it back again for confirmation.\n"
+            "    </phase>\n"
+            "    <phase index=\"5\" name=\"final_booking_and_time_aware_goodbye\">\n"
+            f"      - ONLY after the prospect confirms that the repeated email is YES correct, MANDATORILY invoke the book_appointment tool and let them know that as soon as the call ends they will receive the confirmation via both WhatsApp and email, wishing them {current_farewell}.\n"
+            f"      - If at any point the prospect explicitly rejects the service or call ('not interested', 'too busy, bye', 'wrong number'), wish them {current_farewell} and invoke end_call.\n"
             "    </phase>\n"
             "  </execution_pipeline>\n\n"
             "  <hard_constraints>\n"
-            "    - TTS MICRO-OPENER: Always start your turn with a 2-to-3 word micro-phrase ending in a PERIOD ('Sure, good morning.', 'Perfect, so look.', 'Oh, got it.') before your main sentence so your voice starts instantly.\n"
-            "    - ADAPTIVE LENGTH: Use up to 28 words in Phases 1 and 2 so the prospect clearly understands the reason and value; use 12 to 18 words in Phases 3 and 4 for fast scheduling.\n"
-            "    - STRICT PHONETICS: Reply in a single continuous paragraph without line breaks. NEVER use exclamation marks (!) or leading ellipses (...). Spell out ALL numbers, dates, percentages, and times in lowercase words ('fifty percent', 'november nineteenth', 'ten in the morning').\n"
+            f"    - TTS MICRO-OPENER: Always start your turn with a 2-to-3 word micro-phrase ending in a PERIOD ('Sure, {current_greeting}.', 'Perfect, so look.', 'Got it, sure.') before your main sentence.\n"
+            "    - ONE QUESTION PER TURN: Never ask two different questions in the same turn.\n"
+            "    - STRICT PHONETICS: Reply in a single continuous paragraph without line breaks. NEVER use exclamation marks (!) or leading ellipses (...). Spell out ALL numbers, phone digits, dates, percentages, and times in lowercase words.\n"
             "    - TOOL ISOLATION: NEVER write or speak function names or code in your text response.\n"
             "  </hard_constraints>\n"
             "</agent_system_manifest>"
@@ -460,10 +497,172 @@ async def entrypoint(ctx: JobContext):
         )
 
     call_ending = False
+    booking_state: dict = {
+        "last_user_text": "",
+        "email_read_back_to_user": False,
+    }
 
     @llm.function_tool(
         description=(
-            "Hang up and terminate the phone call. Call this tool immediately in the same turn when the appointment date and time are confirmed and you say goodbye, or when the user explicitly rejects the service."
+            "Calcula en Python la fecha exacta del calendario y consulta los horarios disponibles. "
+            "Invócala SIEMPRE que el cliente mencione un día ('mañana', 'lunes', 'miércoles', 'jueves', 'viernes') "
+            "o una semana ('esta semana'=0, 'próxima semana' o 'semana entrante'=1, 'en dos semanas'=2, 'en tres semanas'=3)."
+        )
+    )
+    async def check_availability(
+        day_of_week: str,
+        weeks_ahead: int = 0,
+    ) -> str:
+        now = datetime.now(ZoneInfo("America/Caracas"))
+        clean_day = day_of_week.lower().strip()
+
+        if "pasado mañana" in clean_day or "day after tomorrow" in clean_day:
+            target_dt = now + timedelta(days=2)
+            phonetic = _format_date_phonetic(target_dt, language)
+            return (
+                f"Fecha exacta calculada para pasado mañana: {phonetic} (ISO: {target_dt.strftime('%Y-%m-%d')}). "
+                "INSTRUCCIÓN: Ofrece primero SOLO DOS opciones (nueve de la mañana o tres de la tarde). También tienes libre diez y once de la mañana, y cuatro y cinco de la tarde."
+            )
+
+        if "mañana" in clean_day or "tomorrow" in clean_day:
+            target_dt = now + timedelta(days=1)
+            phonetic = _format_date_phonetic(target_dt, language)
+            return (
+                f"Fecha exacta calculada para mañana: {phonetic} (ISO: {target_dt.strftime('%Y-%m-%d')}). "
+                "INSTRUCCIÓN: Ofrece primero SOLO DOS opciones (nueve de la mañana o tres de la tarde). También tienes libre diez y once de la mañana, y cuatro y cinco de la tarde."
+            )
+
+        matched_weekday: int | None = None
+        for key, idx in WEEKDAY_MAP.items():
+            if key in clean_day:
+                matched_weekday = idx
+                break
+
+        if matched_weekday is None:
+            matched_weekday = now.weekday()
+
+        # Lunes de la semana actual como ancla matemática exacta
+        monday_current_week = now - timedelta(days=now.weekday())
+        this_week_dt = monday_current_week + timedelta(days=matched_weekday)
+        next_week_dt = monday_current_week + timedelta(weeks=1, days=matched_weekday)
+        two_weeks_dt = monday_current_week + timedelta(weeks=2, days=matched_weekday)
+
+        effective_weeks = max(0, int(weeks_ahead))
+        if effective_weeks == 0 and this_week_dt.date() <= now.date() and "hoy" not in clean_day:
+            effective_weeks = 1
+
+        requested_dt = monday_current_week + timedelta(weeks=effective_weeks, days=matched_weekday)
+
+        req_phonetic = _format_date_phonetic(requested_dt, language)
+        this_wk_phonetic = _format_date_phonetic(this_week_dt, language)
+        next_wk_phonetic = _format_date_phonetic(next_week_dt, language)
+        two_wk_phonetic = _format_date_phonetic(two_weeks_dt, language)
+
+        logger.info(
+            "📅 [CALENDAR TOOL] day='%s' weeks_ahead=%d -> %s (%s)",
+            day_of_week,
+            effective_weeks,
+            req_phonetic,
+            requested_dt.strftime("%Y-%m-%d"),
+        )
+
+        if language == "es":
+            return (
+                f"RESULTADO EXACTO DE CALENDARIO PYTHON:\n"
+                f"- Fecha solicitada ({effective_weeks} semanas adelante): {req_phonetic} ({requested_dt.strftime('%Y-%m-%d')}).\n"
+                f"- Desglose de seguridad: En esta semana actual es {this_wk_phonetic}; "
+                f"en la próxima semana (semana entrante) es {next_wk_phonetic}; "
+                f"en dos semanas es {two_wk_phonetic}.\n"
+                f"- INSTRUCCIÓN DE RESPUESTA: NO leas todos los horarios disponibles. Ofrece primero SOLO DOS opciones (por ejemplo: nueve de la mañana o tres de la tarde). Si el cliente pide otra hora, también tienes libre diez y once de la mañana, y cuatro y cinco de la tarde."
+            )
+        return (
+            f"EXACT PYTHON CALENDAR RESULT:\n"
+            f"- Requested date ({effective_weeks} weeks ahead): {req_phonetic} ({requested_dt.strftime('%Y-%m-%d')}).\n"
+            f"- Reference breakdown: This week is {this_wk_phonetic}; next week is {next_wk_phonetic}; in two weeks is {two_wk_phonetic}.\n"
+            f"- RESPONSE INSTRUCTION: DO NOT read all available slots out loud. Offer ONLY TWO options first (e.g., nine in the morning or three in the afternoon). If they ask for another time, ten am, eleven am, four pm, and five pm are also open."
+        )
+
+    @llm.function_tool(
+        description=(
+            "Registra formalmente la cita ÚNICAMENTE DESPUÉS de haberle repetido el correo electrónico al cliente "
+            "y que el cliente haya respondido que SÍ está correcto. NUNCA la invoques en el mismo turno donde el cliente apenas dicta su correo."
+        )
+    )
+    async def book_appointment(
+        appointment_date: str,
+        appointment_time: str,
+        whatsapp_number: str = "mismo número de la llamada",
+        email: str = "no proporcionado",
+    ) -> str:
+        nonlocal call_ending
+        last_u = booking_state["last_user_text"].lower()
+
+        # Candado determinista: si el cliente acaba de dictar el correo o pidió otro número y aún no se le ha repetido el correo, bloquear cierre prematuro
+        just_dictated_email_or_phone_change = (
+            "arroba" in last_u
+            or "@" in last_u
+            or "gmail" in last_u
+            or "hotmail" in last_u
+            or "outlook" in last_u
+            or "otro número" in last_u
+            or "otro numero" in last_u
+            or "different number" in last_u
+        )
+        if not booking_state["email_read_back_to_user"] and just_dictated_email_or_phone_change:
+            booking_state["email_read_back_to_user"] = True
+            logger.info(
+                "🛡️ [GUARDRAIL] Blocked premature book_appointment — forcing agent to verify phone/email ('%s') with user first.",
+                email,
+            )
+            if "otro número" in last_u or "otro numero" in last_u:
+                return (
+                    f"ALTO - NO CIERRES LA LLAMADA TODAVÍA: El cliente acaba de indicar que prefiere usar OTRO número telefónico para WhatsApp "
+                    f"(y mencionó el correo '{email}'). Pregúntale primero cuál es el mejor número telefónico para su WhatsApp y luego confírmale el correo '{email}' preguntando si está correcto."
+                )
+            return (
+                f"ALTO - NO CIERRES LA LLAMADA TODAVÍA: El cliente acaba de dictar su correo ('{email}'). "
+                f"Según el protocolo obligatorio, primero debes repetirle textualmente el correo '{email}' y preguntarle: '¿Está correcto tu correo?'. "
+                "Solo cuando el cliente te responda que sí, vuelve a invocar book_appointment."
+            )
+
+        resolved_phone = (
+            phone_number
+            if ("mismo" in whatsapp_number.lower() or "same" in whatsapp_number.lower()) and phone_number
+            else whatsapp_number
+        )
+        booking_payload = {
+            "client_name": contact_name or "Cliente",
+            "appointment_date": appointment_date,
+            "appointment_time": appointment_time,
+            "whatsapp_number": resolved_phone,
+            "email": email,
+            "booked_at_iso": datetime.now(ZoneInfo("America/Caracas")).isoformat(),
+        }
+        logger.info("✅ [BOOKING CONFIRMED] %s", json.dumps(booking_payload, ensure_ascii=False))
+
+        if not call_ending:
+            call_ending = True
+            logger.info("📴 Booking completed — waiting for full confirmation & goodbye audio before hanging up…")
+            asyncio.create_task(_terminate_call_session(ctx, session, initial_wait=2.5, max_wait=18.0))
+
+        _, _, dynamic_farewell = _get_time_of_day_phrases(language)
+        if language == "es":
+            return (
+                f"Cita confirmada exitosamente para el {appointment_date} a las {appointment_time} "
+                f"(WhatsApp: {resolved_phone}, Correo confirmado: {email}). "
+                f"Ahora dile al cliente en una frase cálida que al finalizar la llamada estará recibiendo la confirmación tanto por WhatsApp como por correo electrónico, "
+                f"y despídete deseándole que pase {dynamic_farewell}."
+            )
+        return (
+            f"Appointment confirmed for {appointment_date} at {appointment_time} "
+            f"(WhatsApp: {resolved_phone}, Confirmed Email: {email}). "
+            f"Now tell the prospect warmly that upon ending the call they will receive the confirmation via both WhatsApp and email, "
+            f"and wish them {dynamic_farewell}."
+        )
+
+    @llm.function_tool(
+        description=(
+            "Cuelga y finaliza la llamada telefónica. Invócala cuando el cliente rechace el servicio/llamada o después de despedirte."
         )
     )
     async def end_call() -> None:
@@ -472,7 +671,7 @@ async def entrypoint(ctx: JobContext):
             return None
         call_ending = True
         logger.info("📴 Agent triggered end_call tool — waiting for goodbye audio to finish before hanging up…")
-        asyncio.create_task(_terminate_call_session(ctx, session, max_wait=6.5))
+        asyncio.create_task(_terminate_call_session(ctx, session, initial_wait=1.2, max_wait=18.0))
         return None
 
     vad_instance = ctx.proc.userdata.get("vad") or silero.VAD.load(
@@ -486,7 +685,7 @@ async def entrypoint(ctx: JobContext):
         llm=llm_engine,
         tts=tts,
         vad=vad_instance,
-        tools=[end_call],
+        tools=[check_availability, book_appointment, end_call],
     )
 
     last_metrics: dict = {"eou_ms": 0.0, "llm_ttft_ms": 0.0, "tts_ttfb_ms": 0.0}
@@ -533,14 +732,17 @@ async def entrypoint(ctx: JobContext):
         if isinstance(text, list):
             text = " ".join(str(part) for part in text if part)
         if role == "user":
+            booking_state["last_user_text"] = text
             print(f"\n👤 [{contact_name or 'Usuario'}]: {text}", flush=True)
         elif role == "assistant":
             clean_text = text.replace("functions.end_call", "").replace("end_call()", "").strip()
+            if "arroba" in clean_text.lower() or "@" in clean_text.lower() or "correo es" in clean_text.lower():
+                booking_state["email_read_back_to_user"] = True
             print(f"\n🤖 [{agent_display_name}]: {clean_text}\n", flush=True)
             if not call_ending and ("functions.end_call" in text or "end_call(" in text):
                 call_ending = True
                 logger.info("📴 Safety-net triggered end_call from assistant text — waiting for goodbye audio…")
-                asyncio.create_task(_terminate_call_session(ctx, session, max_wait=6.5))
+                asyncio.create_task(_terminate_call_session(ctx, session, initial_wait=1.2, max_wait=18.0))
 
     room_opts = (
         RoomOptions(participant_identity=target_participant.identity)
@@ -569,7 +771,7 @@ async def entrypoint(ctx: JobContext):
     def on_participant_disconnected(participant):
         if target_participant and participant.identity == target_participant.identity:
             logger.info("📴 Participant %s disconnected — destroying room immediately.", participant.identity)
-            asyncio.create_task(_terminate_call_session(ctx, session, max_wait=0.2))
+            asyncio.create_task(_terminate_call_session(ctx, session, initial_wait=0.1, max_wait=0.2))
 
     # Handshake telefónico en 2 fases: primero confirmar línea antes de lanzar el pitch
     if language == "es":
