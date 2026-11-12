@@ -16,6 +16,7 @@ from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 from livekit import api
 from livekit.agents.inference import TTS as InferenceTTS
+from livekit.plugins import cartesia
 from pydantic import BaseModel, field_validator
 
 load_dotenv(override=True)
@@ -456,26 +457,72 @@ async def voice_preview(
     elif model.startswith("rime/") and voice and voice.lower() == "serena":
         model = "rime/arcana"
 
+    cartesia_api_key = os.environ.get("CARTESIA_API_KEY", "").strip()
+
     try:
         async with aiohttp.ClientSession() as http_session:
-            tts_kwargs: Dict[str, Any] = {"model": model, "http_session": http_session}
-            if voice:
-                tts_kwargs["voice"] = voice
-            if not model.startswith("rime/"):
-                tts_kwargs["language"] = language
-
-            tts = InferenceTTS(**tts_kwargs)
-
             audio_chunks: list[bytes] = []
             sample_rate = 24000
 
-            try:
-                stream = tts.synthesize(sample_text)
-                async for event in stream:
-                    audio_chunks.append(bytes(event.frame.data))
-                    sample_rate = event.frame.sample_rate
-            finally:
-                await tts.aclose()
+            if model.startswith("cartesia/") and cartesia_api_key and voice == "c772ce9d-ae93-428b-89f4-49b6d4add9de":
+                raw_cartesia_model = model.split("/", 1)[1] if "/" in model else model
+                cartesia_model = (
+                    "sonic-latest"
+                    if raw_cartesia_model in ("sonic-2", "sonic", "sonic-multilingual")
+                    else raw_cartesia_model
+                )
+                tts = cartesia.TTS(
+                    model=cartesia_model,
+                    voice=voice,
+                    language=language,
+                    api_key=cartesia_api_key,
+                    http_session=http_session,
+                )
+                try:
+                    stream = tts.synthesize(sample_text)
+                    async for event in stream:
+                        audio_chunks.append(bytes(event.frame.data))
+                        sample_rate = event.frame.sample_rate
+                finally:
+                    await tts.aclose()
+            else:
+                tts_kwargs: Dict[str, Any] = {"model": model, "http_session": http_session}
+                if voice:
+                    tts_kwargs["voice"] = voice
+                if not model.startswith("rime/"):
+                    tts_kwargs["language"] = language
+
+                tts = InferenceTTS(**tts_kwargs)
+                try:
+                    stream = tts.synthesize(sample_text)
+                    async for event in stream:
+                        audio_chunks.append(bytes(event.frame.data))
+                        sample_rate = event.frame.sample_rate
+                except Exception:
+                    if not (model.startswith("cartesia/") and cartesia_api_key and voice):
+                        raise
+                    raw_cartesia_model = model.split("/", 1)[1] if "/" in model else model
+                    cartesia_model = (
+                        "sonic-latest"
+                        if raw_cartesia_model in ("sonic-2", "sonic", "sonic-multilingual")
+                        else raw_cartesia_model
+                    )
+                    direct_tts = cartesia.TTS(
+                        model=cartesia_model,
+                        voice=voice,
+                        language=language,
+                        api_key=cartesia_api_key,
+                        http_session=http_session,
+                    )
+                    try:
+                        stream = direct_tts.synthesize(sample_text)
+                        async for event in stream:
+                            audio_chunks.append(bytes(event.frame.data))
+                            sample_rate = event.frame.sample_rate
+                    finally:
+                        await direct_tts.aclose()
+                finally:
+                    await tts.aclose()
 
         pcm = b"".join(audio_chunks)
         buf = io.BytesIO()

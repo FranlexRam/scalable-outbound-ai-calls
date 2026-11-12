@@ -25,7 +25,7 @@ from livekit.agents.inference import (
 )
 from livekit.agents.voice import Agent
 from livekit.agents.voice.room_io import RoomOptions
-from livekit.plugins import openai, silero
+from livekit.plugins import cartesia, openai, silero
 
 # Pre-importar async_toolset para evitar el bloqueo de 159ms en el Event Loop al iniciar sesión
 try:
@@ -527,11 +527,20 @@ async def entrypoint(ctx: JobContext):
             "con nuestra especialista para evaluar su piel sin compromiso."
         ),
     )
-    agent_display_name: str = metadata.get("agent_name", "Daniela")
     voice_id: str | None = (
         metadata.get("voice_id")
         or os.environ.get("VOICE_ID")
         or "cartesia/sonic-2:5c5ad5e7-1020-476b-8b91-fdcbe9cc313c"
+    )
+    default_agent_name = (
+        "Franlex"
+        if voice_id and "c772ce9d-ae93-428b-89f4-49b6d4add9de" in voice_id
+        else "Daniela"
+    )
+    agent_display_name: str = (
+        metadata.get("agent_name")
+        or os.environ.get("AGENT_DISPLAY_NAME")
+        or default_agent_name
     )
     language: str = metadata.get("language") or "es"
     contact_name: str = metadata.get("contact_name", "Franlex")
@@ -574,7 +583,7 @@ async def entrypoint(ctx: JobContext):
             "    <phase index=\"3\" name=\"consulta_determinista_de_fechas_y_horarios\">\n"
             "      - OBLIGATORIO: En cuanto el cliente mencione cualquier día o semana ('hoy', 'mañana', 'el jueves', 'el próximo viernes', 'la próxima semana'), invoca SIEMPRE la herramienta check_availability antes de responder. JAMÁS calcules fechas mentalmente.\n"
             "      - PROHIBIDO recitar una lista larga de horarios: ofrece SOLO DOS opciones concretas primero (una en la mañana y una en la tarde, ej. 'nueve de la mañana o tres de la tarde').\n"
-            "      - Si el cliente pide otra hora, acéptala con flexibilidad. Si no puede en las horas sugeridas, empatiza y pregúntale '¿Qué hora te queda mejor a ti?'.\n"
+            "      - Si el cliente pide otra hora, acéptala con flexibilidad. Si no puede en las horas sugeridas, empatiza y pregúntale '¿Qué hora te queda más cómoda a ti?'.\n"
             "    </phase>\n"
             "    <phase index=\"4\" name=\"confirmacion_paso_a_paso_whatsapp_y_correo\">\n"
             "      PROHIBIDO pedir WhatsApp y correo en la misma pregunta y PROHIBIDO colgar sin verificar los datos. Sigue este orden estricto de una pregunta a la vez:\n"
@@ -669,13 +678,44 @@ async def entrypoint(ctx: JobContext):
     elif model.startswith("rime/") and voice and voice.lower() == "serena":
         model = "rime/arcana"
 
-    tts_kwargs: dict = {"model": model}
-    if voice:
-        tts_kwargs["voice"] = voice
-    if not model.startswith("rime/"):
-        tts_kwargs["language"] = language
+    cartesia_api_key = os.environ.get("CARTESIA_API_KEY", "").strip()
+    is_custom_cartesia_voice = (
+        model.startswith("cartesia/")
+        and bool(cartesia_api_key)
+        and (
+            voice != "5c5ad5e7-1020-476b-8b91-fdcbe9cc313c"
+            or os.environ.get("USE_CARTESIA_BYOK", "0") == "1"
+        )
+    )
 
-    tts = InferenceTTS(**tts_kwargs)
+    if is_custom_cartesia_voice:
+        raw_cartesia_model = model.split("/", 1)[1] if "/" in model else model
+        cartesia_model = (
+            "sonic-latest"
+            if raw_cartesia_model in ("sonic-2", "sonic", "sonic-multilingual")
+            else raw_cartesia_model
+        )
+        cartesia_kwargs: dict = {
+            "model": cartesia_model,
+            "language": language,
+            "api_key": cartesia_api_key,
+        }
+        if voice:
+            cartesia_kwargs["voice"] = voice
+        logger.info(
+            "🎙️ Cartesia Direct Plugin (BYOK) active: model='%s' | voice='%s' | language='%s'",
+            cartesia_model,
+            voice,
+            language,
+        )
+        tts = cartesia.TTS(**cartesia_kwargs)
+    else:
+        tts_kwargs: dict = {"model": model}
+        if voice:
+            tts_kwargs["voice"] = voice
+        if not model.startswith("rime/"):
+            tts_kwargs["language"] = language
+        tts = InferenceTTS(**tts_kwargs)
 
     # Detectar si estamos en modo consola local (gratis) o en sala LiveKit (SIP / WebRTC)
     is_console_mode = (
