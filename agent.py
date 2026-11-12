@@ -49,7 +49,8 @@ AGENT_NAME = "outbound-agent"
 SIP_TRUNK_ID = os.environ.get("LIVEKIT_SIP_TRUNK_ID", "")
 DEFAULT_TTS_MODEL = "cartesia/sonic-2"
 DEFAULT_LIVEKIT_LLM_MODEL = os.environ.get("LIVEKIT_LLM_MODEL", "openai/gpt-4o-mini")
-DEFAULT_OPENROUTER_LLM_MODEL = os.environ.get("OPENROUTER_LLM_MODEL", "openai/gpt-4o-mini")
+DEFAULT_OPENROUTER_LLM_MODEL = os.environ.get("OPENROUTER_LLM_MODEL", "anthropic/claude-haiku-5.5")
+SECONDARY_OPENROUTER_LLM_MODEL = os.environ.get("SECONDARY_OPENROUTER_LLM_MODEL", "google/gemini-2.5-flash")
 QUOTA_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".lk_quota_state.json")
 
 
@@ -58,23 +59,28 @@ def _current_year_month() -> str:
 
 
 def _is_livekit_quota_exhausted_this_month() -> bool:
-    """Devuelve True si los créditos gratis de LiveKit ya se agotaron en el mes actual; se resetea solo al cambiar de mes."""
+    """Devuelve True si los créditos gratis del proyecto actual de LiveKit se agotaron este mes; se resetea al cambiar de mes o de proyecto."""
+    current_url = os.environ.get("LIVEKIT_URL", "").strip()
     try:
         if os.path.exists(QUOTA_STATE_FILE):
             with open(QUOTA_STATE_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            return data.get("exhausted_month") == _current_year_month()
+            return (
+                data.get("exhausted_month") == _current_year_month()
+                and data.get("livekit_url") == current_url
+            )
     except Exception:
         pass
     return False
 
 
 def _mark_livekit_quota_exhausted_this_month() -> None:
-    """Registra que el mes actual agotó los créditos gratis de LiveKit para ir directo a OpenRouter hasta el próximo mes."""
+    """Registra que el proyecto actual agotó sus créditos gratis este mes para enrutar directo a OpenRouter hasta el próximo mes."""
     ym = _current_year_month()
+    current_url = os.environ.get("LIVEKIT_URL", "").strip()
     try:
         with open(QUOTA_STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"exhausted_month": ym}, f)
+            json.dump({"exhausted_month": ym, "livekit_url": current_url}, f)
     except Exception:
         pass
 
@@ -306,36 +312,46 @@ def _get_temporal_context(language: str) -> str:
     )
 
 
+def _create_openrouter_client(model_name: str, api_key: str) -> llm.LLM:
+    """Crea un cliente OpenRouter optimizado por latencia y blindado contra el bloqueo regional 403 de OpenAI."""
+    provider_cfg: dict = {
+        "sort": "latency",
+        "allow_fallbacks": True,
+    }
+    if model_name.startswith("openai/"):
+        provider_cfg["ignore"] = ["OpenAI"]
+
+    try:
+        return openai.LLM(
+            model=model_name,
+            base_url="https://openrouter.ai/api/v1",
+            api_key=api_key,
+            temperature=0.5,
+            extra_body={"provider": provider_cfg},
+        )
+    except TypeError:
+        return openai.LLM(
+            model=model_name,
+            base_url="https://openrouter.ai/api/v1",
+            api_key=api_key,
+            temperature=0.5,
+        )
+
+
 def _build_llm() -> llm.LLM:
-    """Construye el motor LLM con conmutación mensual inteligente entre los créditos gratis de LiveKit y tu OpenRouter Key."""
+    """Construye el motor LLM Multi-Tier: Primary = LiveKit Virginia (~400ms) → Fallback 1 = Claude Haiku 5.5 (~713ms) → Fallback 2 = Gemini 2.5 Flash (~711ms)."""
     llm_api_key = (
         os.environ.get("OPENROUTER_API_KEY")
         or os.environ.get("OPENAI_API_KEY")
         or ""
     ).strip()
 
-    openrouter_llm: llm.LLM | None = None
+    openrouter_primary: llm.LLM | None = None
+    openrouter_secondary: llm.LLM | None = None
     if llm_api_key:
-        try:
-            openrouter_llm = openai.LLM(
-                model=DEFAULT_OPENROUTER_LLM_MODEL,
-                base_url="https://openrouter.ai/api/v1",
-                api_key=llm_api_key,
-                temperature=0.5,
-                extra_body={
-                    "provider": {
-                        "sort": "latency",
-                        "allow_fallbacks": True,
-                    },
-                },
-            )
-        except TypeError:
-            openrouter_llm = openai.LLM(
-                model=DEFAULT_OPENROUTER_LLM_MODEL,
-                base_url="https://openrouter.ai/api/v1",
-                api_key=llm_api_key,
-                temperature=0.5,
-            )
+        openrouter_primary = _create_openrouter_client(DEFAULT_OPENROUTER_LLM_MODEL, llm_api_key)
+        if SECONDARY_OPENROUTER_LLM_MODEL and SECONDARY_OPENROUTER_LLM_MODEL != DEFAULT_OPENROUTER_LLM_MODEL:
+            openrouter_secondary = _create_openrouter_client(SECONDARY_OPENROUTER_LLM_MODEL, llm_api_key)
 
     livekit_llm: llm.LLM | None = None
     if os.environ.get("USE_LIVEKIT_LLM", "1") != "0":
@@ -353,23 +369,39 @@ def _build_llm() -> llm.LLM:
             logger.warning("Could not initialize LiveKit InferenceLLM: %s", exc)
 
     quota_exhausted = _is_livekit_quota_exhausted_this_month()
-    if quota_exhausted and openrouter_llm is not None:
+    if quota_exhausted and openrouter_primary is not None:
+        fallback_chain = [m for m in (openrouter_primary, openrouter_secondary) if m is not None]
+        if len(fallback_chain) > 1 and hasattr(llm, "FallbackAdapter"):
+            for kwarg_name in ("llm", "llms"):
+                try:
+                    adapter = llm.FallbackAdapter(**{kwarg_name: fallback_chain})
+                    logger.info(
+                        "🧠 LiveKit quota exhausted for %s — routing directly to OpenRouter Dual Engine: Primary='%s' | Backup='%s'",
+                        _current_year_month(),
+                        DEFAULT_OPENROUTER_LLM_MODEL,
+                        SECONDARY_OPENROUTER_LLM_MODEL,
+                    )
+                    return adapter
+                except TypeError:
+                    continue
         logger.info(
-            "🧠 LiveKit free quota exhausted for %s — routing directly to OpenRouter Primary='%s' (0ms retry overhead). Will auto-reset next month.",
+            "🧠 LiveKit quota exhausted for %s — routing directly to OpenRouter Primary='%s' (0ms retry overhead).",
             _current_year_month(),
             DEFAULT_OPENROUTER_LLM_MODEL,
         )
-        return openrouter_llm
+        return openrouter_primary
 
-    if livekit_llm is not None and openrouter_llm is not None:
+    if livekit_llm is not None and openrouter_primary is not None:
+        chain = [m for m in (livekit_llm, openrouter_primary, openrouter_secondary) if m is not None]
         if hasattr(llm, "FallbackAdapter"):
             for kwarg_name in ("llm", "llms"):
                 try:
-                    adapter = llm.FallbackAdapter(**{kwarg_name: [livekit_llm, openrouter_llm]})
+                    adapter = llm.FallbackAdapter(**{kwarg_name: chain})
                     logger.info(
-                        "🧠 Production Dual LLM active: Primary='%s' (LiveKit Virginia ~400ms) | Fallback='%s' (OpenRouter Latency-Sorted)",
+                        "🧠 Production Multi-Tier LLM active: Primary='%s' (LiveKit Virginia ~400ms) | Fallback 1='%s' (~713ms) | Fallback 2='%s' (~711ms)",
                         DEFAULT_LIVEKIT_LLM_MODEL,
                         DEFAULT_OPENROUTER_LLM_MODEL,
+                        SECONDARY_OPENROUTER_LLM_MODEL,
                     )
                     return adapter
                 except TypeError:
@@ -384,9 +416,9 @@ def _build_llm() -> llm.LLM:
         logger.info("🧠 Primary LLM Engine active: '%s' (LiveKit Virginia)", DEFAULT_LIVEKIT_LLM_MODEL)
         return livekit_llm
 
-    if openrouter_llm is not None:
+    if openrouter_primary is not None:
         logger.info("🧠 Fallback LLM Engine active: '%s' (OpenRouter Lowest-Latency)", DEFAULT_OPENROUTER_LLM_MODEL)
-        return openrouter_llm
+        return openrouter_primary
 
     raise RuntimeError("CRITICAL: Neither OpenRouter LLM nor LiveKit InferenceLLM could be initialized!")
 
