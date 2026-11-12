@@ -464,7 +464,7 @@ async def voice_preview(
             audio_chunks: list[bytes] = []
             sample_rate = 24000
 
-            if model.startswith("cartesia/") and cartesia_api_key and voice == "c772ce9d-ae93-428b-89f4-49b6d4add9de":
+            if model.startswith("cartesia/") and cartesia_api_key and voice and voice != "5c5ad5e7-1020-476b-8b91-fdcbe9cc313c":
                 raw_cartesia_model = model.split("/", 1)[1] if "/" in model else model
                 cartesia_model = (
                     "sonic-latest"
