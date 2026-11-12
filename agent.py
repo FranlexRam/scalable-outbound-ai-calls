@@ -49,7 +49,46 @@ AGENT_NAME = "outbound-agent"
 SIP_TRUNK_ID = os.environ.get("LIVEKIT_SIP_TRUNK_ID", "")
 DEFAULT_TTS_MODEL = "cartesia/sonic-2"
 DEFAULT_LIVEKIT_LLM_MODEL = os.environ.get("LIVEKIT_LLM_MODEL", "openai/gpt-4o-mini")
-DEFAULT_OPENROUTER_LLM_MODEL = os.environ.get("OPENROUTER_LLM_MODEL", "anthropic/claude-haiku-5.5")
+DEFAULT_OPENROUTER_LLM_MODEL = os.environ.get("OPENROUTER_LLM_MODEL", "openai/gpt-4o-mini")
+QUOTA_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".lk_quota_state.json")
+
+
+def _current_year_month() -> str:
+    return datetime.now(ZoneInfo("America/Caracas")).strftime("%Y-%m")
+
+
+def _is_livekit_quota_exhausted_this_month() -> bool:
+    """Devuelve True si los créditos gratis de LiveKit ya se agotaron en el mes actual; se resetea solo al cambiar de mes."""
+    try:
+        if os.path.exists(QUOTA_STATE_FILE):
+            with open(QUOTA_STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data.get("exhausted_month") == _current_year_month()
+    except Exception:
+        pass
+    return False
+
+
+def _mark_livekit_quota_exhausted_this_month() -> None:
+    """Registra que el mes actual agotó los créditos gratis de LiveKit para ir directo a OpenRouter hasta el próximo mes."""
+    ym = _current_year_month()
+    try:
+        with open(QUOTA_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"exhausted_month": ym}, f)
+    except Exception:
+        pass
+
+
+class _QuotaCircuitBreakerHandler(logging.Handler):
+    """Detecta en tiempo real el error 429 MaxGatewayCredits de LiveKit y activa el bypass mensual hacia OpenRouter."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        msg = record.getMessage()
+        if "MaxGatewayCredits" in msg or "QuotaStatusExceeded" in msg or "credit quota exceeded" in msg:
+            _mark_livekit_quota_exhausted_this_month()
+
+
+logging.getLogger("livekit.agents").addHandler(_QuotaCircuitBreakerHandler())
 
 DAYS_ES = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
 DAYS_EN = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
@@ -128,10 +167,59 @@ PHONE_UNITS_TO_INT = {
     "ocho": 8, "eight": 8,
     "nueve": 9, "nine": 9,
 }
+PHONE_HUNDREDS_TO_INT = {
+    "cien": 100, "ciento": 100,
+    "doscientos": 200, "doscientas": 200,
+    "trescientos": 300, "trescientas": 300,
+    "cuatrocientos": 400, "cuatrocientas": 400,
+    "quinientos": 500, "quinientas": 500,
+    "seiscientos": 600, "seiscientas": 600,
+    "setecientos": 700, "setecientas": 700,
+    "ochocientos": 800, "ochocientas": 800,
+    "novecientos": 900, "novecientas": 900,
+}
+VE_AREA_PREFIXES = ("412", "414", "424", "416", "426", "422", "2")
+
+
+def _format_to_e164_ve(raw_input: str) -> str:
+    """Convierte cualquier teléfono venezolano (con o sin 0 inicial) al estándar internacional E.164 (+58...)."""
+    digits = re.sub(r"\D", "", raw_input)
+    if not digits:
+        return ""
+    if len(digits) == 11 and digits.startswith("0") and digits[1:].startswith(VE_AREA_PREFIXES):
+        return f"+58{digits[1:]}"
+    if len(digits) == 10 and digits.startswith(VE_AREA_PREFIXES):
+        return f"+58{digits}"
+    if len(digits) == 12 and digits.startswith("58") and digits[2:].startswith(VE_AREA_PREFIXES):
+        return f"+{digits}"
+    if len(digits) == 13 and digits.startswith("580") and digits[3:].startswith(VE_AREA_PREFIXES):
+        return f"+58{digits[3:]}"
+    if 10 <= len(digits) <= 15:
+        return f"+{digits}"
+    return ""
+
+
+def _parse_sub_100(tokens: list[str], idx: int) -> tuple[int | None, int]:
+    """Lee un número del 1 al 99 a partir de tokens[idx] para combinarlo con centenas o decenas."""
+    if idx >= len(tokens):
+        return None, idx
+    tok = tokens[idx]
+    if tok in PHONE_TENS_TO_INT:
+        tens_val = PHONE_TENS_TO_INT[tok]
+        if idx + 2 < len(tokens) and tokens[idx + 1] == "y" and tokens[idx + 2] in PHONE_UNITS_TO_INT:
+            return tens_val + PHONE_UNITS_TO_INT[tokens[idx + 2]], idx + 3
+        if idx + 1 < len(tokens) and tokens[idx + 1] in PHONE_UNITS_TO_INT:
+            return tens_val + PHONE_UNITS_TO_INT[tokens[idx + 1]], idx + 2
+        return tens_val, idx + 1
+    if tok in PHONE_WORD_TO_DIGITS and int(PHONE_WORD_TO_DIGITS[tok]) >= 10:
+        return int(PHONE_WORD_TO_DIGITS[tok]), idx + 1
+    if tok in PHONE_UNITS_TO_INT:
+        return PHONE_UNITS_TO_INT[tok], idx + 1
+    return None, idx
 
 
 def _extract_phone_digits_from_text(text: str) -> str:
-    """Extrae de forma 100% determinista en Python los dígitos de un teléfono dictado en palabras o números."""
+    """Extrae de forma 100% determinista el teléfono en formato E.164 (+58...) aunque el STT agrupe en centenas o miles."""
     lower = text.lower()
     if "arroba" in lower or "@" in lower or "gmail" in lower or "hotmail" in lower or "outlook" in lower:
         return ""
@@ -140,28 +228,34 @@ def _extract_phone_digits_from_text(text: str) -> str:
     i = 0
     while i < len(tokens):
         tok = tokens[i]
+        if tok in ("mil", "millon", "millón", "millones"):
+            i += 1
+            continue
         if tok.isdigit():
             result.append(tok)
             i += 1
             continue
-        if tok in PHONE_TENS_TO_INT:
-            tens_val = PHONE_TENS_TO_INT[tok]
-            if i + 2 < len(tokens) and tokens[i + 1] == "y" and tokens[i + 2] in PHONE_UNITS_TO_INT:
-                result.append(str(tens_val + PHONE_UNITS_TO_INT[tokens[i + 2]]))
-                i += 3
-                continue
-            if i + 1 < len(tokens) and tokens[i + 1] in PHONE_UNITS_TO_INT:
-                result.append(str(tens_val + PHONE_UNITS_TO_INT[tokens[i + 1]]))
-                i += 2
-                continue
-            result.append(str(tens_val))
-            i += 1
+        if tok in PHONE_HUNDREDS_TO_INT:
+            h_val = PHONE_HUNDREDS_TO_INT[tok]
+            sub_val, next_i = _parse_sub_100(tokens, i + 1)
+            if sub_val is not None:
+                result.append(str(h_val + sub_val))
+                i = next_i
+            else:
+                result.append(str(h_val))
+                i += 1
             continue
+        if tok in PHONE_TENS_TO_INT:
+            sub_val, next_i = _parse_sub_100(tokens, i)
+            if sub_val is not None:
+                result.append(str(sub_val))
+                i = next_i
+                continue
         if tok in PHONE_WORD_TO_DIGITS:
             result.append(PHONE_WORD_TO_DIGITS[tok])
         i += 1
-    digits = "".join(result)
-    return digits if 7 <= len(digits) <= 15 else ""
+
+    return _format_to_e164_ve("".join(result))
 
 
 def _format_date_phonetic(dt: datetime, language: str) -> str:
@@ -213,7 +307,7 @@ def _get_temporal_context(language: str) -> str:
 
 
 def _build_llm() -> llm.LLM:
-    """Construye el motor LLM de Producción: Primary = LiveKit Inference (Virginia ~400ms) | Fallback = Claude Haiku 5.5 (OpenRouter Latency-Sorted)."""
+    """Construye el motor LLM con conmutación mensual inteligente entre los créditos gratis de LiveKit y tu OpenRouter Key."""
     llm_api_key = (
         os.environ.get("OPENROUTER_API_KEY")
         or os.environ.get("OPENAI_API_KEY")
@@ -257,6 +351,15 @@ def _build_llm() -> llm.LLM:
                 logger.warning("Could not initialize LiveKit InferenceLLM: %s", exc)
         except Exception as exc:
             logger.warning("Could not initialize LiveKit InferenceLLM: %s", exc)
+
+    quota_exhausted = _is_livekit_quota_exhausted_this_month()
+    if quota_exhausted and openrouter_llm is not None:
+        logger.info(
+            "🧠 LiveKit free quota exhausted for %s — routing directly to OpenRouter Primary='%s' (0ms retry overhead). Will auto-reset next month.",
+            _current_year_month(),
+            DEFAULT_OPENROUTER_LLM_MODEL,
+        )
+        return openrouter_llm
 
     if livekit_llm is not None and openrouter_llm is not None:
         if hasattr(llm, "FallbackAdapter"):
@@ -437,16 +540,16 @@ async def entrypoint(ctx: JobContext):
             "Primero explica en 1 oración clara (máximo 25 palabras) en qué consiste el beneficio o paso propuesto en <business_instructions> sin compromiso, y cierra preguntando qué día o semana le quedaría más cómodo.\n"
             "    </phase>\n"
             "    <phase index=\"3\" name=\"consulta_determinista_de_fechas_y_horarios\">\n"
-            "      - OBLIGATORIO: En cuanto el cliente mencione cualquier día o semana ('mañana', 'el jueves', 'el próximo viernes', 'la próxima semana'), invoca SIEMPRE la herramienta check_availability antes de responder. JAMÁS calcules fechas mentalmente.\n"
+            "      - OBLIGATORIO: En cuanto el cliente mencione cualquier día o semana ('hoy', 'mañana', 'el jueves', 'el próximo viernes', 'la próxima semana'), invoca SIEMPRE la herramienta check_availability antes de responder. JAMÁS calcules fechas mentalmente.\n"
             "      - PROHIBIDO recitar una lista larga de horarios: ofrece SOLO DOS opciones concretas primero (una en la mañana y una en la tarde, ej. 'nueve de la mañana o tres de la tarde').\n"
-            "      - Si el cliente pide otra hora, acéptala con flexibilidad. Si no puede en las horas sugeridas, empatiza y pregúntale '¿Qué hora te queda más cómoda a ti?'.\n"
+            "      - Si el cliente pide otra hora, acéptala con flexibilidad. Si no puede en las horas sugeridas, empatiza y pregúntale '¿Qué hora te queda mejor a ti?'.\n"
             "    </phase>\n"
             "    <phase index=\"4\" name=\"confirmacion_paso_a_paso_whatsapp_y_correo\">\n"
             "      PROHIBIDO pedir WhatsApp y correo en la misma pregunta y PROHIBIDO colgar sin verificar los datos. Sigue este orden estricto de una pregunta a la vez:\n"
             "      - PASO 4.1 (Confirmar WhatsApp): Apenas el cliente elija día y hora, dile que le reservas ese horario, explícale que la confirmación se envía tanto por WhatsApp como por correo electrónico, y pregúntale ÚNICAMENTE: '¿Te envío la confirmación por WhatsApp a este mismo número?'.\n"
             "      - PASO 4.2 (Rama Sí / Rama No del WhatsApp):\n"
             "        * Si el cliente dice que SÍ usa este mismo número: pídele ahora su correo electrónico ('Perfecto, ¿y a qué correo electrónico te envío la confirmación?').\n"
-            "        * Si el cliente dice que NO o que prefiere otro número: pregúntale primero '¿Cuál sería el mejor número telefónico para enviarte la confirmación por WhatsApp?'. Cuando te dé el número, confírmalo brevemente y ahí sí pídele su correo electrónico.\n"
+            "        * Si el cliente dice que NO o que prefiere otro número: pregúntale primero '¿Cuál sería el mejor número telefónico para enviarte la confirmación por WhatsApp?'. Cuando te dé el número, repítelo tal como lo dijo el cliente en pares o dígitos sueltos (PROHIBIDO decir 'mil', 'ciento', 'cientos' o 'millones': si el transcriptor escribió 'cuatrocientos veinticuatro mil ciento veintidós seis siete nueve seis', tú debes decir 'cuatro veinticuatro, uno dos dos, seis siete nueve seis') y luego pídele su correo electrónico.\n"
             "      - PASO 4.3 (Verificación obligatoria del Correo / Read-Back): Cuando el cliente te dicte su correo electrónico, NO invoques book_appointment todavía. Repítele el correo en palabras fonéticas (escribiendo 'punto' y 'arroba' en letras para tu voz, ej. 'Perfecto, verifico que tu correo sea franlex punto ramirez dos arroba gmail punto com, ¿está correcto?'). Si el cliente dice que está incorrecto o corrige algo, haz la corrección y vuelve a repetírselo en palabras para confirmar.\n"
             "    </phase>\n"
             "    <phase index=\"5\" name=\"registro_final_y_despedida_acorde_a_la_hora\">\n"
@@ -457,7 +560,7 @@ async def entrypoint(ctx: JobContext):
             "  <hard_constraints>\n"
             f"    - MICRO-APERTURA TTS: Inicia siempre tu respuesta con una micro-frase de 2 a 3 palabras cerrada con PUNTO SEGUIDO ('Claro, {current_greeting}.', 'Perfecto, mira.', 'Claro, con gusto.') antes de la oración principal para acelerar tu voz.\n"
             "    - UNA PREGUNTA POR TURNO: Nunca hagas dos preguntas distintas en el mismo turno.\n"
-            "    - FONÉTICA ESTRICTA: Un solo párrafo continuo sin saltos de línea. PROHIBIDO usar signos de exclamación (¡ !) o puntos suspensivos al inicio. Escribe TODOS los números, teléfonos, fechas, porcentajes y horas en letras minúsculas ('cincuenta por ciento', 'veinte de noviembre', 'nueve de la mañana').\n"
+            "    - FONÉTICA ESTRICTA Y TELÉFONOS NATURALES: Un solo párrafo continuo sin saltos de línea. PROHIBIDO usar signos de exclamación (¡ !) o puntos suspensivos al inicio. Escribe TODOS los números, fechas, porcentajes y horas en letras minúsculas. JAMÁS pronuncies las palabras 'mil', 'ciento', 'cientos' ni 'millones' al repetir un número telefónico.\n"
             "    - AISLAMIENTO DE HERRAMIENTAS: JAMÁS escribas ni pronuncies nombres de funciones o código en tu respuesta de texto.\n"
             "  </hard_constraints>\n"
             "</agent_system_manifest>"
@@ -488,7 +591,7 @@ async def entrypoint(ctx: JobContext):
             "First explain in 1 clear sentence (max 25 words) how the benefit or next step in <business_instructions> works with no obligation, then ask what day or week works best for them.\n"
             "    </phase>\n"
             "    <phase index=\"3\" name=\"deterministic_date_lookup_and_negotiation\">\n"
-            "      - MANDATORY: Whenever the prospect mentions any day or relative week ('tomorrow', 'this Thursday', 'next Friday'), ALWAYS invoke the check_availability tool first. NEVER calculate dates mentally.\n"
+            "      - MANDATORY: Whenever the prospect mentions any day or relative week ('today', 'tomorrow', 'this Thursday', 'next Friday'), ALWAYS invoke the check_availability tool first. NEVER calculate dates mentally.\n"
             "      - NEVER recite a long list of times: offer ONLY TWO concrete options first (one in the morning and one in the afternoon).\n"
             "      - If the prospect suggests another time, accept it immediately. If neither works, empathize and ask 'What time works best for you?'.\n"
             "    </phase>\n"
@@ -497,7 +600,7 @@ async def entrypoint(ctx: JobContext):
             "      - STEP 4.1 (Confirm WhatsApp): Once day and time are agreed, tell them you are reserving that slot, explain that the confirmation is sent via both WhatsApp and email, and ask ONLY: 'Should I send the WhatsApp confirmation to this same phone number?'.\n"
             "      - STEP 4.2 (WhatsApp Yes / No Branch):\n"
             "        * If they say YES to this same number: ask for their email address ('Perfect, and what email address should I send the confirmation to?').\n"
-            "        * If they say NO or prefer another number: first ask 'What is the best phone number to send your WhatsApp confirmation to?'. Once they give the number, confirm it briefly and then ask for their email address.\n"
+            "        * If they say NO or prefer another number: first ask 'What is the best phone number to send your WhatsApp confirmation to?'. Once they give the number, repeat it back naturally in individual digits or pairs (NEVER say 'thousand' or 'hundred') and then ask for their email address.\n"
             "      - STEP 4.3 (Mandatory Email Read-Back Loop): When the prospect gives their email address, DO NOT invoke book_appointment yet. Repeat the email back clearly in spoken words (using 'dot' and 'at' for your voice) and ask 'Is that email correct?'. If they say it is incorrect, apply the correction and repeat it back again for confirmation.\n"
             "    </phase>\n"
             "    <phase index=\"5\" name=\"final_booking_and_time_aware_goodbye\">\n"
@@ -508,7 +611,7 @@ async def entrypoint(ctx: JobContext):
             "  <hard_constraints>\n"
             f"    - TTS MICRO-OPENER: Always start your turn with a 2-to-3 word micro-phrase ending in a PERIOD ('Sure, {current_greeting}.', 'Perfect, so look.', 'Got it, sure.') before your main sentence.\n"
             "    - ONE QUESTION PER TURN: Never ask two different questions in the same turn.\n"
-            "    - STRICT PHONETICS: Reply in a single continuous paragraph without line breaks. NEVER use exclamation marks (!) or leading ellipses (...). Spell out ALL numbers, phone digits, dates, percentages, and times in lowercase words.\n"
+            "    - STRICT PHONETICS: Reply in a single continuous paragraph without line breaks. NEVER use exclamation marks (!) or leading ellipses (...). Spell out ALL numbers, phone digits, dates, percentages, and times in lowercase words. NEVER read phone numbers as 'hundreds' or 'thousands'.\n"
             "    - TOOL ISOLATION: NEVER write or speak function names or code in your text response.\n"
             "  </hard_constraints>\n"
             "</agent_system_manifest>"
@@ -603,7 +706,7 @@ async def entrypoint(ctx: JobContext):
     @llm.function_tool(
         description=(
             "Calcula en Python la fecha exacta del calendario y consulta los horarios disponibles. "
-            "Invócala SIEMPRE que el cliente mencione un día ('mañana', 'lunes', 'miércoles', 'jueves', 'viernes') "
+            "Invócala SIEMPRE que el cliente mencione un día ('hoy', 'mañana', 'lunes', 'miércoles', 'jueves', 'viernes', 'sábado') "
             "o una semana ('esta semana'=0, 'próxima semana' o 'semana entrante'=1, 'en dos semanas'=2, 'en tres semanas'=3)."
         )
     )
@@ -613,6 +716,7 @@ async def entrypoint(ctx: JobContext):
     ) -> str:
         now = datetime.now(ZoneInfo("America/Caracas"))
         clean_day = day_of_week.lower().strip()
+        last_u_day = booking_state["last_user_text"].lower()
 
         if "pasado mañana" in clean_day or "day after tomorrow" in clean_day:
             target_dt = now + timedelta(days=2)
@@ -628,6 +732,19 @@ async def entrypoint(ctx: JobContext):
             return (
                 f"Fecha exacta calculada para mañana: {phonetic} (ISO: {target_dt.strftime('%Y-%m-%d')}). "
                 "INSTRUCCIÓN: Ofrece primero SOLO DOS opciones (nueve de la mañana o tres de la tarde). También tienes libre diez y once de la mañana, y cuatro y cinco de la tarde."
+            )
+
+        if "hoy" in clean_day or "today" in clean_day or "para hoy" in last_u_day or "es hoy" in last_u_day:
+            phonetic = _format_date_phonetic(now, language)
+            logger.info("📅 [CALENDAR TOOL] day='%s' (HOY) -> %s (%s)", day_of_week, phonetic, now.strftime("%Y-%m-%d"))
+            if language == "es":
+                return (
+                    f"Fecha exacta calculada para HOY: {phonetic} (ISO: {now.strftime('%Y-%m-%d')}). "
+                    "INSTRUCCIÓN: Sí tienes disponibilidad para hoy. Ofrece primero SOLO DOS opciones (por ejemplo: once de la mañana o tres de la tarde). También tienes libre cuatro y cinco de la tarde."
+                )
+            return (
+                f"Exact date for TODAY: {phonetic} (ISO: {now.strftime('%Y-%m-%d')}). "
+                "INSTRUCTION: You DO have availability today. Offer ONLY TWO options first (e.g., eleven in the morning or three in the afternoon)."
             )
 
         matched_weekday: int | None = None
@@ -646,7 +763,7 @@ async def entrypoint(ctx: JobContext):
         two_weeks_dt = monday_current_week + timedelta(weeks=2, days=matched_weekday)
 
         effective_weeks = max(0, int(weeks_ahead))
-        if effective_weeks == 0 and this_week_dt.date() <= now.date() and "hoy" not in clean_day:
+        if effective_weeks == 0 and this_week_dt.date() < now.date():
             effective_weeks = 1
 
         requested_dt = monday_current_week + timedelta(weeks=effective_weeks, days=matched_weekday)
@@ -723,15 +840,18 @@ async def entrypoint(ctx: JobContext):
                 "Solo cuando el cliente te responda que sí, vuelve a invocar book_appointment."
             )
 
+        llm_e164 = _format_to_e164_ve(whatsapp_number)
         if booking_state["extracted_phone_digits"]:
             resolved_phone = booking_state["extracted_phone_digits"]
             logger.info(
-                "📞 [PHONE PARSER] Deterministic Python phone applied: '%s' (LLM passed: '%s')",
+                "📞 [PHONE PARSER] Deterministic Python E.164 phone applied: '%s' (LLM passed: '%s')",
                 resolved_phone,
                 whatsapp_number,
             )
+        elif llm_e164:
+            resolved_phone = llm_e164
         elif ("mismo" in whatsapp_number.lower() or "same" in whatsapp_number.lower()) and phone_number:
-            resolved_phone = phone_number
+            resolved_phone = _format_to_e164_ve(phone_number) or phone_number
         else:
             resolved_phone = whatsapp_number
 
@@ -841,7 +961,7 @@ async def entrypoint(ctx: JobContext):
             parsed_digits = _extract_phone_digits_from_text(text)
             if parsed_digits:
                 booking_state["extracted_phone_digits"] = parsed_digits
-                logger.info("📞 [PHONE PARSER] Captured exact phone digits from user speech: %s", parsed_digits)
+                logger.info("📞 [PHONE PARSER] Captured exact E.164 phone from user speech: %s", parsed_digits)
             print(f"\n👤 [{contact_name or 'Usuario'}]: {text}", flush=True)
         elif role == "assistant":
             clean_text = text.replace("functions.end_call", "").replace("end_call()", "").strip()
