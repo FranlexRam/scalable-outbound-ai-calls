@@ -17,6 +17,7 @@ from livekit.agents import (
     WorkerOptions,
     cli,
     llm,
+    stt as lk_stt,
 )
 from livekit.agents.inference import (
     LLM as InferenceLLM,
@@ -25,7 +26,7 @@ from livekit.agents.inference import (
 )
 from livekit.agents.voice import Agent
 from livekit.agents.voice.room_io import RoomOptions
-from livekit.plugins import cartesia, openai, silero
+from livekit.plugins import cartesia, deepgram, openai, silero
 
 # Pre-importar async_toolset para evitar el bloqueo de 159ms en el Event Loop al iniciar sesión
 try:
@@ -90,7 +91,12 @@ class _QuotaCircuitBreakerHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         msg = record.getMessage()
-        if "MaxGatewayCredits" in msg or "QuotaStatusExceeded" in msg or "credit quota exceeded" in msg:
+        if (
+            "MaxGatewayCredits" in msg
+            or "QuotaStatusExceeded" in msg
+            or "credit quota exceeded" in msg
+            or ("agent-gateway.livekit.cloud" in msg and "429" in msg)
+        ):
             _mark_livekit_quota_exhausted_this_month()
 
 
@@ -352,6 +358,8 @@ def _create_openrouter_client(model_name: str, api_key: str) -> llm.LLM:
     }
     if model_name.startswith("openai/"):
         provider_cfg["ignore"] = ["OpenAI"]
+    elif model_name.startswith("anthropic/"):
+        provider_cfg["order"] = ["Anthropic"]
 
     try:
         return openai.LLM(
@@ -453,6 +461,72 @@ def _build_llm() -> llm.LLM:
         return openrouter_primary
 
     raise RuntimeError("CRITICAL: Neither OpenRouter LLM nor LiveKit InferenceLLM could be initialized!")
+
+
+def _build_stt(language: str, contact_name: str = "") -> lk_stt.STT:
+    """Construye el motor STT (Oído) con Deepgram Directo (BYOK ~150ms) como primario y Cartesia STT como respaldo."""
+    deepgram_api_key = os.environ.get("DEEPGRAM_API_KEY", "").strip()
+    cartesia_api_key = os.environ.get("CARTESIA_API_KEY", "").strip()
+    stt_lang = "es" if language == "es" else "en"
+
+    primary_stt: lk_stt.STT | None = None
+    backup_stt: lk_stt.STT | None = None
+
+    if deepgram_api_key:
+        custom_terms = ["Franlex", "Ramírez", "Zen Spa", "Plexus Code", "gmail.com"]
+        if contact_name and contact_name.strip() not in custom_terms:
+            custom_terms.insert(0, contact_name.strip())
+        for dg_kwargs in (
+            {"keyterm": custom_terms, "filler_words": True},
+            {"keyterm": custom_terms},
+            {"keyterms": custom_terms},
+            {},
+        ):
+            try:
+                primary_stt = deepgram.STT(
+                    model="nova-3",
+                    language=stt_lang,
+                    api_key=deepgram_api_key,
+                    **dg_kwargs,
+                )
+                break
+            except TypeError:
+                continue
+
+    if cartesia_api_key and hasattr(cartesia, "STT"):
+        try:
+            backup_stt = cartesia.STT(
+                model="ink-whisper",
+                language=stt_lang,
+                api_key=cartesia_api_key,
+            )
+        except Exception as exc:
+            logger.debug("Cartesia backup STT note: %s", exc)
+
+    if primary_stt is not None and backup_stt is not None and hasattr(lk_stt, "FallbackAdapter"):
+        for kwarg_name in ("stt", "stts"):
+            try:
+                adapter = lk_stt.FallbackAdapter(**{kwarg_name: [primary_stt, backup_stt]})
+                logger.info(
+                    "🎧 Production Dual STT active: Primary='deepgram/nova-3' (Direct BYOK) | Fallback='cartesia/ink-whisper' (Direct BYOK)"
+                )
+                return adapter
+            except TypeError:
+                continue
+            except Exception as exc:
+                logger.debug("STT FallbackAdapter note: %s", exc)
+                break
+
+    if primary_stt is not None:
+        logger.info("🎧 Direct Deepgram STT (BYOK) active: model='nova-3' | language='%s'", stt_lang)
+        return primary_stt
+
+    if backup_stt is not None:
+        logger.info("🎧 Direct Cartesia STT (BYOK) active: model='ink-whisper' | language='%s'", stt_lang)
+        return backup_stt
+
+    logger.info("🎧 LiveKit Inference STT active: model='deepgram/nova-3' | language='%s'", stt_lang)
+    return InferenceSTT(model="deepgram/nova-3", language=stt_lang)
 
 
 def prewarm(proc: JobProcess) -> None:
@@ -615,18 +689,18 @@ async def entrypoint(ctx: JobContext):
             "Tu tono es cálido, empático, natural y ejecutivo. Tratas al cliente de tú con cercanía sin repetir su nombre en cada turno.\n"
             "  </identity>\n\n"
             "  <execution_pipeline>\n"
-            "    <phase index=\"1\" name=\"apertura_con_motivo_y_beneficio\">\n"
-            f"      En cuanto el cliente confirme que es él después del 'Aló', saluda usando '{current_greeting}' (NUNCA digas 'buen día' si es de noche), "
-            "menciona de dónde llamas, explica POR QUÉ lo llamas y cuál es su beneficio especial según <call_context> y <business_instructions>, y cierra preguntando suavemente si tiene medio minuto.\n"
+            "    <phase index=\"1\" name=\"turno_1_el_gancho_corto\">\n"
+            f"      En cuanto el cliente confirme que es él después del 'Aló', responde de forma contundente y concisa (máximo 22 palabras) con esta estructura exacta adaptada a <business_instructions>: "
+            f"'Hola, {current_greeting}. Te hablo de Zen Spa porque tienes aprobado un cincuenta por ciento de descuento en depilación láser por ser cliente frecuente. ¿Tienes treinta segundos para explicarte?'\n"
             "    </phase>\n"
-            "    <phase index=\"2\" name=\"explicacion_de_valor_antes_de_horarios\">\n"
-            "      Cuando el cliente diga 'Sí, ok' o pregunte '¿De qué trata? / ¿Por qué me llamas?', NUNCA lances horarios en frío. "
-            "Primero explica en 1 oración clara (máximo 25 palabras) en qué consiste el beneficio o paso propuesto en <business_instructions> sin compromiso, y cierra preguntando qué día o semana le quedaría mejor.\n"
+            "    <phase index=\"2\" name=\"turno_2_el_valor_y_validacion_de_interes\">\n"
+            "      Cuando el cliente diga 'Sí, dime', 'Sí, ok' o pregunte '¿De qué trata?', NO pidas fechas todavía. Explica el beneficio en una sola oración corta (máximo 22 palabras) y valida su interés con esta estructura: "
+            "'Perfecto. Mira, te incluimos una valoración gratuita de quince minutos con nuestra especialista para evaluar tu piel sin compromiso. ¿Te interesaría probarlo?'\n"
             "    </phase>\n"
-            "    <phase index=\"3\" name=\"consulta_rapida_de_fechas_y_horarios\">\n"
-            "      - Usa directamente las fechas exactas de <temporal_awareness> para responder AL INSTANTE (sin invocar check_availability) cuando el cliente pida 'hoy', 'mañana', 'pasado mañana', o cualquier día de 'esta semana' o de 'la próxima semana'. Invoca check_availability SOLO si pide una fecha de dos o más semanas en el futuro.\n"
-            "      - PROHIBIDO recitar una lista larga de horarios: ofrece SOLO DOS opciones concretas primero (una en la mañana y una en la tarde, ej. 'nueve de la mañana o tres de la tarde').\n"
-            "      - Si el cliente pide otros horarios en la mañana, ofrece diez y once de la mañana. Si pide otros en la tarde, ofrece cuatro y cinco de la tarde.\n"
+            "    <phase index=\"3\" name=\"turno_3_transicion_a_agenda_y_horarios_con_expresiones_humanas\">\n"
+            "      - PASO 3.1 (Preguntar Día): Cuando el cliente confirme que le interesa ('Sí, me interesa', 'Claro', 'Ok'), responde únicamente: 'Excelente. ¿Qué día de esta semana o de la próxima tendrías disponibilidad?'\n"
+            "      - PASO 3.2 (Dar Disponibilidad en 2 Opciones): Cuando el cliente mencione un día de esta semana o de la próxima, usa directamente <temporal_awareness> (sin invocar check_availability) y ofrece SOLO DOS opciones primero (ej. 'nueve de la mañana o tres de la tarde'). Invoca check_availability SOLO si el cliente pregunta por dentro de dos, tres o más semanas.\n"
+            "      - PASO 3.3 (Cambio de Hora con Expresiones Humanas): Si el cliente pregunta por otra hora ('¿Tienes a las cuatro de la tarde?' o '¿Qué otros horarios tienes en la mañana?'), usa muletillas humanas naturales de revisión antes de confirmar, por ejemplo: 'Mmm, déjame ver aquí un segundito. Ah, sí tengo disponible a las cuatro de la tarde. ¿Te lo reservo a esa hora entonces?'\n"
             "    </phase>\n"
             "    <phase index=\"4\" name=\"confirmacion_paso_a_paso_whatsapp_y_correo\">\n"
             "      PROHIBIDO pedir WhatsApp y correo en la misma pregunta y PROHIBIDO colgar sin verificar los datos. Sigue este orden estricto de una pregunta a la vez:\n"
@@ -643,9 +717,9 @@ async def entrypoint(ctx: JobContext):
             "    </phase>\n"
             "  </execution_pipeline>\n\n"
             "  <hard_constraints>\n"
-            f"    - MICRO-APERTURA TTS (CRÍTICO PARA LATENCIA): Inicia SIEMPRE tu respuesta con 1 o 2 palabras seguidas de un PUNTO SEGUIDO inmediato ('Claro.', 'Perfecto.', 'Entendido.', 'Claro, {current_greeting}.'). PROHIBIDO usar comas después de la primera palabra (NUNCA escribas 'Genial, entonces,' ni 'Claro, mira,').\n"
-            "    - UNA PREGUNTA POR TURNO: Nunca hagas dos preguntas distintas en el mismo turno.\n"
-            "    - FONÉTICA ESTRICTA Y TELÉFONOS NATURALES: Un solo párrafo continuo sin saltos de línea. PROHIBIDO usar signos de exclamación (¡ !) o puntos suspensivos al inicio. Escribe TODOS los números, fechas, porcentajes y horas en letras minúsculas. JAMÁS pronuncies las palabras 'mil', 'ciento', 'cientos' ni 'millones' al repetir un número telefónico.\n"
+            f"    - MICRO-APERTURA TTS Y EXPRESIONES HUMANAS: Inicia siempre tu respuesta con una micro-frase de 1 a 3 palabras cerrada con PUNTO SEGUIDO ('Perfecto.', 'Excelente.', 'Claro.', 'Mmm, déjame ver.') antes de la oración principal para que tu voz salga al instante. Usa expresiones conversacionales humanas ('Mmm...', 'Ah, mira,', 'Eh, claro.') cuando revises horarios o respondas dudas.\n"
+            "    - BREVEDAD EJECUTIVA Y UNA PREGUNTA POR TURNO: Ninguna respuesta debe superar las 28 palabras. Nunca hagas dos preguntas distintas en el mismo turno.\n"
+            "    - FONÉTICA ESTRICTA Y TELÉFONOS NATURALES: Un solo párrafo continuo sin saltos de línea. PROHIBIDO usar signos de exclamación (¡ !). Escribe TODOS los números, fechas, porcentajes y horas en letras minúsculas ('treinta segundos', 'quince minutos'). JAMÁS pronuncies las palabras 'mil', 'ciento', 'cientos' ni 'millones' al repetir un número telefónico.\n"
             "    - AISLAMIENTO DE HERRAMIENTAS: JAMÁS escribas ni pronuncies nombres de funciones o código en tu respuesta de texto.\n"
             "  </hard_constraints>\n"
             "</agent_system_manifest>"
@@ -667,18 +741,18 @@ async def entrypoint(ctx: JobContext):
             "Your tone is warm, empathetic, natural, and executive. Do not overuse the prospect's name in every turn.\n"
             "  </identity>\n\n"
             "  <execution_pipeline>\n"
-            "    <phase index=\"1\" name=\"contextual_opening_with_reason_and_benefit\">\n"
-            f"      As soon as the prospect confirms it is them after 'Hello?', greet them using '{current_greeting}', "
-            "state where you are calling from, explain WHY you are calling and their specific benefit based on <call_context> and <business_instructions>, and softly ask if they have half a minute.\n"
+            "    <phase index=\"1\" name=\"turn_1_short_hook\">\n"
+            f"      As soon as the prospect confirms it is them after 'Hello?', reply concisely (max 22 words): "
+            f"'Hi, {current_greeting}. I am calling from Zen Spa because you have a pre-approved fifty percent discount on laser hair removal as a frequent client. Do you have thirty seconds?'\n"
             "    </phase>\n"
-            "    <phase index=\"2\" name=\"value_explanation_before_scheduling\">\n"
-            "      When the prospect says 'Sure / Okay' or asks 'What is this about? / Why is it free?', NEVER push time slots cold. "
-            "First explain in 1 clear sentence (max 25 words) how the benefit or next step in <business_instructions> works with no obligation, then ask what day or week works best for them.\n"
+            "    <phase index=\"2\" name=\"turn_2_value_and_interest_check\">\n"
+            "      When the prospect says 'Sure / Go ahead' or asks 'What is this about?', DO NOT ask for dates yet. Explain the value in one short sentence and check interest: "
+            "'Perfect. Look, we are including a free fifteen-minute diagnostic skin assessment with our specialist with no obligation. Would you be interested in trying it?'\n"
             "    </phase>\n"
-            "    <phase index=\"3\" name=\"deterministic_date_lookup_and_negotiation\">\n"
-            "      - Use <temporal_awareness> directly for 'today' or 'tomorrow'. Invoke check_availability for other days or weeks.\n"
-            "      - NEVER recite a long list of times: offer ONLY TWO concrete options first (one in the morning and one in the afternoon).\n"
-            "      - If the prospect suggests another time, accept it immediately. If neither works, empathize and ask 'What time works best for you?'.\n"
+            "    <phase index=\"3\" name=\"turn_3_schedule_transition_and_human_fillers\">\n"
+            "      - STEP 3.1: Once they confirm interest ('Yes', 'Sure'), ask ONLY: 'Excellent. What day this week or next week would you have availability?'\n"
+            "      - STEP 3.2: Use <temporal_awareness> directly for this week or next week, offering ONLY TWO options first (e.g., nine am or three pm). Invoke check_availability ONLY for dates two or more weeks ahead.\n"
+            "      - STEP 3.3: When checking another time slot, use natural human fillers: 'Mmm, let me check right here. Ah, yes, I do have four in the afternoon open. Should I book that time for you then?'\n"
             "    </phase>\n"
             "    <phase index=\"4\" name=\"step_by_step_whatsapp_and_email_verification\">\n"
             "      NEVER ask for WhatsApp and email in the same question, and NEVER hang up without verifying their email. Follow this strict one-question-at-a-time sequence:\n"
@@ -695,9 +769,9 @@ async def entrypoint(ctx: JobContext):
             "    </phase>\n"
             "  </execution_pipeline>\n\n"
             "  <hard_constraints>\n"
-            f"    - TTS MICRO-OPENER: Always start your turn with a 1-to-2 word micro-phrase ending in a PERIOD ('Sure.', 'Perfect.', 'Got it.') before your main sentence.\n"
-            "    - ONE QUESTION PER TURN: Never ask two different questions in the same turn.\n"
-            "    - STRICT PHONETICS: Reply in a single continuous paragraph without line breaks. NEVER use exclamation marks (!) or leading ellipses (...). Spell out ALL numbers, phone digits, dates, percentages, and times in lowercase words. NEVER read phone numbers as 'hundreds' or 'thousands'.\n"
+            f"    - TTS MICRO-OPENER & HUMAN FILLERS: Always start your turn with a 1-to-3 word micro-phrase ending in a PERIOD ('Sure.', 'Perfect.', 'Mmm, let me see.') before your main sentence.\n"
+            "    - ONE QUESTION PER TURN: Keep every reply under 28 words and never ask two questions in the same turn.\n"
+            "    - STRICT PHONETICS: Reply in a single continuous paragraph without line breaks. NEVER use exclamation marks (!). Spell out ALL numbers, phone digits, dates, percentages, and times in lowercase words. NEVER read phone numbers as 'hundreds' or 'thousands'.\n"
             "    - TOOL ISOLATION: NEVER write or speak function names or code in your text response.\n"
             "  </hard_constraints>\n"
             "</agent_system_manifest>"
@@ -780,11 +854,7 @@ async def entrypoint(ctx: JobContext):
 
         logger.info("Participant joined: %s — starting agent session", target_participant.identity)
 
-    if language == "es":
-        stt = InferenceSTT(model="deepgram/nova-3", language="es")
-    else:
-        stt = InferenceSTT(model="deepgram/nova-3", language="en")
-
+    stt = _build_stt(language, contact_name)
     llm_engine = _build_llm()
 
     session: AgentSession
@@ -823,7 +893,7 @@ async def entrypoint(ctx: JobContext):
 
     @llm.function_tool(
         description=(
-            "Calcula en Python la fecha exacta del calendario cuando el cliente pida fechas lejanas (en dos semanas=2, en tres semanas=3). "
+            "Calcula en Python la fecha exacta del calendario cuando el cliente pida fechas lejanas (en dos semanas=2, en tres semanas=3, en cuatro semanas=4). "
             "Para hoy, mañana, esta semana o la próxima semana usa directamente <temporal_awareness>."
         )
     )
