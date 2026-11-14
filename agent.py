@@ -18,6 +18,7 @@ from livekit.agents import (
     cli,
     llm,
     stt as lk_stt,
+    tts as lk_tts,
 )
 from livekit.agents.inference import (
     LLM as InferenceLLM,
@@ -49,7 +50,8 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 AGENT_NAME = "outbound-agent"
 SIP_TRUNK_ID = os.environ.get("LIVEKIT_SIP_TRUNK_ID", "")
 DEFAULT_TTS_MODEL = "cartesia/sonic-2"
-DEFAULT_CARTESIA_SPEED = float(os.environ.get("CARTESIA_SPEED", "1.12"))
+DEFAULT_ES_TEST_VOICE = "deepgram/aura-2:celeste-es"
+DEFAULT_EN_TEST_VOICE = "cartesia/sonic-3:f786b574-daa5-4673-aa0c-cbe3e8534c02"
 DEFAULT_LIVEKIT_LLM_MODEL = os.environ.get("LIVEKIT_LLM_MODEL", "openai/gpt-4o-mini")
 DEFAULT_OPENROUTER_LLM_MODEL = os.environ.get("OPENROUTER_LLM_MODEL", "google/gemini-2.5-flash")
 SECONDARY_OPENROUTER_LLM_MODEL = os.environ.get("SECONDARY_OPENROUTER_LLM_MODEL", "anthropic/claude-haiku-5.5")
@@ -118,6 +120,15 @@ NUMBERS_ES = {
     26: "veintiséis", 27: "veintisiete", 28: "veintiocho", 29: "veintinueve", 30: "treinta",
     31: "treinta y uno",
 }
+NUMBERS_ORDINAL_EN = {
+    1: "first", 2: "second", 3: "third", 4: "fourth", 5: "fifth",
+    6: "sixth", 7: "seventh", 8: "eighth", 9: "ninth", 10: "tenth",
+    11: "eleventh", 12: "twelfth", 13: "thirteenth", 14: "fourteenth", 15: "fifteenth",
+    16: "sixteenth", 17: "seventeenth", 18: "eighteenth", 19: "nineteenth", 20: "twentieth",
+    21: "twenty-first", 22: "twenty-second", 23: "twenty-third", 24: "twenty-fourth", 25: "twenty-fifth",
+    26: "twenty-sixth", 27: "twenty-seventh", 28: "twenty-eighth", 29: "twenty-ninth", 30: "thirtieth",
+    31: "thirty-first",
+}
 WEEKDAY_MAP = {
     "lunes": 0, "monday": 0,
     "martes": 1, "tuesday": 1,
@@ -181,7 +192,7 @@ PHONE_UNITS_TO_INT = {
     "nueve": 9, "nine": 9,
 }
 PHONE_HUNDREDS_TO_INT = {
-    "cien": 100, "ciento": 100,
+    "cien": 100, "ciento": 100, "hundred": 100,
     "doscientos": 200, "doscientas": 200,
     "trescientos": 300, "trescientas": 300,
     "cuatrocientos": 400, "cuatrocientas": 400,
@@ -232,18 +243,41 @@ def _parse_sub_100(tokens: list[str], idx: int) -> tuple[int | None, int]:
 
 
 def _extract_phone_digits_from_text(text: str) -> str:
-    """Extrae de forma 100% determinista el teléfono en formato E.164 (+58...) aunque el STT agrupe en centenas o miles."""
+    """Extrae de forma 100% determinista el teléfono en formato E.164 (+58...) en español o inglés (incluyendo 'double'/'triple')."""
     lower = text.lower()
-    if "arroba" in lower or "@" in lower or "gmail" in lower or "hotmail" in lower or "outlook" in lower:
+    if (
+        "arroba" in lower
+        or "@" in lower
+        or "gmail" in lower
+        or "hotmail" in lower
+        or "outlook" in lower
+        or "yahoo" in lower
+        or "icloud" in lower
+        or "dot com" in lower
+    ):
         return ""
     tokens = re.findall(r"[a-záéíóúñ]+|\d+", lower)
     result: list[str] = []
     i = 0
     while i < len(tokens):
         tok = tokens[i]
-        if tok in ("mil", "millon", "millón", "millones"):
+        if tok in ("mil", "millon", "millón", "millones", "thousand", "million"):
             i += 1
             continue
+        if tok in ("double", "doble") and i + 1 < len(tokens):
+            nxt = tokens[i + 1]
+            d = nxt if nxt.isdigit() else PHONE_WORD_TO_DIGITS.get(nxt, "")
+            if len(d) == 1:
+                result.append(d * 2)
+                i += 2
+                continue
+        if tok in ("triple",) and i + 1 < len(tokens):
+            nxt = tokens[i + 1]
+            d = nxt if nxt.isdigit() else PHONE_WORD_TO_DIGITS.get(nxt, "")
+            if len(d) == 1:
+                result.append(d * 3)
+                i += 2
+                continue
         if tok.isdigit():
             result.append(tok)
             i += 1
@@ -272,7 +306,7 @@ def _extract_phone_digits_from_text(text: str) -> str:
 
 
 def _sanitize_stt_text(text: str, contact_name: str = "") -> str:
-    """Corrige errores fonéticos recurrentes del STT (ej. cuando el usuario pide quitar la 'k' de 'Franklex' pero Deepgram vuelve a transcribir 'Franklex')."""
+    """Corrige errores fonéticos recurrentes del STT en español e inglés (ej. 'Franklex' -> 'Franlex')."""
     lower = text.lower()
     asks_to_remove_k = (
         "sin la k" in lower
@@ -281,6 +315,10 @@ def _sanitize_stt_text(text: str, contact_name: str = "") -> str:
         or "agregaste una k" in lower
         or "letra k" in lower
         or "no lleva k" in lower
+        or "without the k" in lower
+        or "without k" in lower
+        or "no k" in lower
+        or "letter k" in lower
     )
     if asks_to_remove_k or contact_name.strip().lower() == "franlex":
         if asks_to_remove_k:
@@ -289,13 +327,32 @@ def _sanitize_stt_text(text: str, contact_name: str = "") -> str:
 
 
 def _format_date_phonetic(dt: datetime, language: str) -> str:
-    """Convierte un objeto datetime a texto fonético exacto ('miércoles dieciocho de noviembre')."""
+    """Convierte un objeto datetime a texto fonético exacto sin el año en español o inglés."""
     if language == "es":
         day_name = DAYS_ES[dt.weekday()]
         day_word = NUMBERS_ES.get(dt.day, str(dt.day))
         month_name = MONTHS_ES[dt.month - 1]
         return f"{day_name} {day_word} de {month_name}"
-    return dt.strftime("%A, %B %d")
+    day_name_en = DAYS_EN[dt.weekday()]
+    month_name_en = dt.strftime("%B")
+    day_ordinal_en = NUMBERS_ORDINAL_EN.get(dt.day, str(dt.day))
+    return f"{day_name_en}, {month_name_en} {day_ordinal_en}"
+
+
+def _clean_spoken_date(raw_date: str, language: str) -> str:
+    """Convierte fechas ISO a fonéticas y elimina cualquier mención al año ('de dos mil veintiséis' / '2026')."""
+    clean = raw_date.strip()
+    try:
+        parsed_dt = datetime.strptime(clean, "%Y-%m-%d")
+        return _format_date_phonetic(parsed_dt, language)
+    except Exception:
+        pass
+    clean = re.sub(
+        r"(?i)\s*(de\s+|del\s+|in\s+|of\s+)?(dos\s+mil\s+veint[a-záéíóú]+|two\s+thousand\s+twenty[\s-]*\w+|twenty\s+twenty[\s-]*\w+|202\d)\b",
+        "",
+        clean,
+    ).strip(" ,.")
+    return clean
 
 
 def _get_time_of_day_phrases(language: str) -> tuple[str, str, str]:
@@ -308,46 +365,60 @@ def _get_time_of_day_phrases(language: str) -> tuple[str, str, str]:
             return "de la tarde", "buenas tardes", "una feliz tarde"
         return "de la noche", "buenas noches", "una feliz noche"
     if now.hour < 12:
-        return "AM", "good morning", "a wonderful day"
+        return "in the morning", "good morning", "a wonderful day"
     if now.hour < 19:
-        return "PM", "good afternoon", "a wonderful afternoon"
-    return "PM", "good evening", "a wonderful evening"
+        return "in the afternoon", "good afternoon", "a wonderful afternoon"
+    return "in the evening", "good evening", "a wonderful evening"
 
 
-def _get_temporal_context(language: str) -> str:
-    """Pre-calcula en Python el calendario exacto de esta semana y la próxima para responder en 1 solo viaje (ahorrando ~850ms de tool call)."""
+def _get_temporal_context(language: str, custom_schedule: str = "") -> str:
+    """Pre-calcula en Python el calendario exacto de 14 días (en ES y EN) e inyecta el horario configurable del negocio."""
     now = datetime.now(ZoneInfo("America/Caracas"))
     period, greeting_phrase, farewell_phrase = _get_time_of_day_phrases(language)
     monday_this_week = now - timedelta(days=now.weekday())
     tomorrow = now + timedelta(days=1)
     day_after = now + timedelta(days=2)
 
-    if language == "es":
-        this_week_items = []
-        next_week_items = []
-        for d_idx in range(7):
-            dt_this = monday_this_week + timedelta(days=d_idx)
-            dt_next = monday_this_week + timedelta(weeks=1, days=d_idx)
-            if dt_this.date() >= now.date():
-                this_week_items.append(f"{_format_date_phonetic(dt_this, 'es')} ({dt_this.strftime('%Y-%m-%d')})")
-            next_week_items.append(f"{_format_date_phonetic(dt_next, 'es')} ({dt_next.strftime('%Y-%m-%d')})")
+    this_week_items = []
+    next_week_items = []
+    for d_idx in range(7):
+        dt_this = monday_this_week + timedelta(days=d_idx)
+        dt_next = monday_this_week + timedelta(weeks=1, days=d_idx)
+        if dt_this.date() >= now.date():
+            this_week_items.append(f"{_format_date_phonetic(dt_this, language)} ({dt_this.strftime('%Y-%m-%d')})")
+        next_week_items.append(f"{_format_date_phonetic(dt_next, language)} ({dt_next.strftime('%Y-%m-%d')})")
 
-        hour_12 = now.hour % 12 or 12
+    hour_12 = now.hour % 12 or 12
+
+    if language == "es":
+        schedule_es = custom_schedule.strip() or (
+            "Horario de atención del negocio: de nueve de la mañana a cinco de la tarde. "
+            "Cupos disponibles actualmente todos los días: en la mañana nueve, diez y once de la mañana; "
+            "en la tarde tres, cuatro y cinco de la tarde."
+        )
         return (
-            f"Ahora mismo (HOY) es {_format_date_phonetic(now, 'es')} de {now.year} ({now.strftime('%Y-%m-%d')}), {hour_12}:{now.minute:02d} {period}. "
+            f"Ahora mismo (HOY) es {_format_date_phonetic(now, 'es')} ({now.strftime('%Y-%m-%d')}), {hour_12}:{now.minute:02d} {period}. "
             f"MAÑANA es {_format_date_phonetic(tomorrow, 'es')} ({tomorrow.strftime('%Y-%m-%d')}). "
             f"PASADO MAÑANA es {_format_date_phonetic(day_after, 'es')} ({day_after.strftime('%Y-%m-%d')}). "
             f"Días restantes de ESTA SEMANA: {'; '.join(this_week_items)}. "
             f"Días de LA PRÓXIMA SEMANA (semana entrante): {'; '.join(next_week_items)}. "
-            f"Horarios libres todos los días: en la mañana nueve, diez y once de la mañana; en la tarde tres, cuatro y cinco de la tarde. "
+            f"{schedule_es} "
             f"Saludo actual: '{greeting_phrase}'. Despedida actual: 'que pases {farewell_phrase}'."
         )
 
+    schedule_en = custom_schedule.strip() or (
+        "Business operating hours: nine in the morning to five in the afternoon. "
+        "Currently available slots every day: in the morning at nine, ten, and eleven in the morning; "
+        "in the afternoon at three, four, and five in the afternoon."
+    )
     return (
-        f"Right now (TODAY) is {now.strftime('%A, %B %d, %Y')} ({now.strftime('%Y-%m-%d')}), {now.strftime('%I:%M %p')}. "
-        f"TOMORROW is {tomorrow.strftime('%A, %B %d')} ({tomorrow.strftime('%Y-%m-%d')}). "
-        f"Available slots every day: 9 AM, 10 AM, 11 AM, 3 PM, 4 PM, and 5 PM. "
-        f"Greeting: '{greeting_phrase}'. Farewell: 'have {farewell_phrase}'."
+        f"Right now (TODAY) is {_format_date_phonetic(now, 'en')} ({now.strftime('%Y-%m-%d')}), {hour_12}:{now.minute:02d} {period}. "
+        f"TOMORROW is {_format_date_phonetic(tomorrow, 'en')} ({tomorrow.strftime('%Y-%m-%d')}). "
+        f"DAY AFTER TOMORROW is {_format_date_phonetic(day_after, 'en')} ({day_after.strftime('%Y-%m-%d')}). "
+        f"Remaining days THIS WEEK: {'; '.join(this_week_items)}. "
+        f"Days NEXT WEEK: {'; '.join(next_week_items)}. "
+        f"{schedule_en} "
+        f"Current greeting: '{greeting_phrase}'. Current farewell: 'have {farewell_phrase}'."
     )
 
 
@@ -480,6 +551,7 @@ def _build_stt(language: str, contact_name: str = "") -> lk_stt.STT:
         if contact_name and contact_name.strip() not in custom_terms:
             custom_terms.insert(0, contact_name.strip())
         for dg_kwargs in (
+            {"keyterm": custom_terms, "filler_words": True, "endpointing_ms": 25, "no_delay": True},
             {"keyterm": custom_terms, "filler_words": True},
             {"keyterm": custom_terms},
             {"keyterms": custom_terms},
@@ -530,6 +602,93 @@ def _build_stt(language: str, contact_name: str = "") -> lk_stt.STT:
 
     logger.info("🎧 LiveKit Inference STT active: model='deepgram/nova-3' | language='%s'", stt_lang)
     return InferenceSTT(model="deepgram/nova-3", language=stt_lang)
+
+
+def _build_tts(voice_id: str | None, language: str) -> lk_tts.TTS:
+    """Construye el motor TTS priorizando BYOK directo (Deepgram Aura-2 para Celeste = 0 créditos Cartesia, o Cartesia sonic-3/sonic-latest)."""
+    deepgram_api_key = os.environ.get("DEEPGRAM_API_KEY", "").strip()
+    cartesia_api_key = os.environ.get("CARTESIA_API_KEY", "").strip()
+
+    model = voice_id if voice_id else DEFAULT_TTS_MODEL
+    voice: str | None = None
+    if voice_id and ":" in voice_id:
+        idx = voice_id.rfind(":")
+        voice = voice_id[idx + 1:]
+        model = voice_id[:idx]
+
+    # 1. Si la voz seleccionada es de Deepgram (ej. Celeste 'deepgram/aura-2:celeste-es'), usar Deepgram Direct Plugin (0 créditos de Cartesia)
+    if model.startswith("deepgram/") and deepgram_api_key:
+        lang_suffix = "es" if language == "es" else "en"
+        clean_voice = re.sub(r"-(es|en)$", "", (voice or "celeste")).strip()
+        dg_tts_model = f"aura-2-{clean_voice}-{lang_suffix}"
+        logger.info(
+            "🎙️ Deepgram Direct TTS (BYOK - 0 Cartesia credits) active: model='%s' | language='%s'",
+            dg_tts_model,
+            language,
+        )
+        return deepgram.TTS(model=dg_tts_model, api_key=deepgram_api_key)
+
+    # 2. Si la voz seleccionada es de Cartesia (ej. 'cartesia/sonic-3:...' en inglés o voz clonada)
+    if model.startswith("cartesia/") and cartesia_api_key:
+        raw_cartesia_model = model.split("/", 1)[1] if "/" in model else model
+        cartesia_model = (
+            "sonic-latest"
+            if raw_cartesia_model in ("sonic-2", "sonic", "sonic-multilingual")
+            else raw_cartesia_model
+        )
+        cartesia_kwargs: dict = {
+            "model": cartesia_model,
+            "language": language,
+            "api_key": cartesia_api_key,
+        }
+        if voice:
+            cartesia_kwargs["voice"] = voice
+
+        primary_tts = cartesia.TTS(**cartesia_kwargs)
+
+        # Si se pidió 'sonic-3', agregar respaldo automático a 'sonic-latest' y Deepgram TTS por si el endpoint o los créditos fallan
+        fallback_list: list[lk_tts.TTS] = [primary_tts]
+        if cartesia_model == "sonic-3":
+            fallback_kwargs = dict(cartesia_kwargs, model="sonic-latest")
+            fallback_list.append(cartesia.TTS(**fallback_kwargs))
+        if deepgram_api_key:
+            dg_backup_model = "aura-2-celeste-es" if language == "es" else "aura-2-thalia-en"
+            fallback_list.append(deepgram.TTS(model=dg_backup_model, api_key=deepgram_api_key))
+
+        if len(fallback_list) > 1 and hasattr(lk_tts, "FallbackAdapter"):
+            for kwarg_name in ("tts", "ttss"):
+                try:
+                    adapter = lk_tts.FallbackAdapter(**{kwarg_name: fallback_list})
+                    logger.info(
+                        "🎙️ Cartesia Direct Plugin (BYOK) active: model='%s' | voice='%s' | language='%s' (with auto-fallback)",
+                        cartesia_model,
+                        voice,
+                        language,
+                    )
+                    return adapter
+                except TypeError:
+                    continue
+
+        logger.info(
+            "🎙️ Cartesia Direct Plugin (BYOK) active: model='%s' | voice='%s' | language='%s'",
+            cartesia_model,
+            voice,
+            language,
+        )
+        return primary_tts
+
+    # 3. Respaldo general si no hay llave de Cartesia pero sí de Deepgram
+    if deepgram_api_key:
+        dg_default = "aura-2-celeste-es" if language == "es" else "aura-2-thalia-en"
+        logger.info("🎙️ Deepgram Direct TTS Fallback active: model='%s'", dg_default)
+        return deepgram.TTS(model=dg_default, api_key=deepgram_api_key)
+
+    tts_kwargs: dict = {"model": model}
+    if voice:
+        tts_kwargs["voice"] = voice
+    if not model.startswith("rime/"):
+        tts_kwargs["language"] = language
+    return InferenceTTS(**tts_kwargs)
 
 
 def prewarm(proc: JobProcess) -> None:
@@ -631,45 +790,57 @@ async def entrypoint(ctx: JobContext):
         metadata.get("phone_number")
         or os.environ.get("DEFAULT_CLIENT_PHONE", "+584241226796")
     )
-    agent_instructions: str = metadata.get(
-        "agent_instructions",
+    language: str = metadata.get("language") or os.environ.get("AGENT_LANGUAGE", "es")
+    default_instructions = (
         (
             "Representas a Zen Spa. El objetivo es invitar al cliente a aprovechar su cincuenta por ciento de descuento "
             "en paquetes de depilación láser definitiva y agendarle una sesión de valoración diagnóstica gratuita de quince minutos "
             "con nuestra especialista para evaluar su piel sin compromiso."
-        ),
+        )
+        if language == "es"
+        else (
+            "You represent Zen Spa. Your goal is to invite the client to use their pre-approved fifty percent discount "
+            "on laser hair removal packages and schedule a free fifteen-minute diagnostic skin assessment with our specialist "
+            "with no obligation."
+        )
     )
+    agent_instructions: str = metadata.get("agent_instructions") or default_instructions
+
+    use_cloned_voice = os.environ.get("USE_CLONED_VOICE", "0") == "1"
+    default_test_voice = DEFAULT_ES_TEST_VOICE if language == "es" else DEFAULT_EN_TEST_VOICE
     voice_id: str | None = (
         metadata.get("voice_id")
-        or os.environ.get("VOICE_ID")
-        or "cartesia/sonic-2:5c5ad5e7-1020-476b-8b91-fdcbe9cc313c"
+        or (os.environ.get("VOICE_ID") if use_cloned_voice else None)
+        or default_test_voice
     )
-    female_voice_keys = (
-        "5c5ad5e7-1020-476b-8b91-fdcbe9cc313c",
-        "serena",
-        "antonia",
-        "celeste",
-        "aquila",
-        "estrella",
-        "diana",
-        "carina",
-        "selena",
-    )
-    is_female_default = any(k in (voice_id or "").lower() for k in female_voice_keys)
-    default_agent_name = "Daniela" if is_female_default else "Franlex"
+    voice_lower = (voice_id or "").lower()
+    if "celeste" in voice_lower:
+        default_agent_name = "Celeste"
+    elif "f786b574-daa5-4673-aa0c-cbe3e8534c02" in voice_lower or "thalia" in voice_lower:
+        default_agent_name = "Sophia" if language == "en" else "Daniela"
+    elif any(k in voice_lower for k in ("5c5ad5e7-1020-476b-8b91-fdcbe9cc313c", "serena", "antonia", "aquila", "estrella", "diana", "carina", "selena")):
+        default_agent_name = "Daniela"
+    else:
+        default_agent_name = "Franlex"
+
     agent_display_name: str = (
         metadata.get("agent_name")
-        or os.environ.get("AGENT_DISPLAY_NAME")
+        or (os.environ.get("AGENT_DISPLAY_NAME") if use_cloned_voice else None)
         or default_agent_name
     )
-    language: str = metadata.get("language") or "es"
     contact_name: str = metadata.get("contact_name", "Franlex")
-    personalization_context: str = metadata.get(
-        "personalization_context",
-        "Cliente frecuente y leal de Zen Spa. Tiene pre-aprobado un cincuenta por ciento de descuento en depilación láser definitiva y valoración inicial sin costo.",
+    default_context = (
+        "Cliente frecuente y leal de Zen Spa. Tiene pre-aprobado un cincuenta por ciento de descuento en depilación láser definitiva y valoración inicial sin costo."
+        if language == "es"
+        else "Frequent and loyal client at Zen Spa. Pre-approved for a fifty percent discount on laser hair removal and a free initial diagnostic assessment."
+    )
+    personalization_context: str = metadata.get("personalization_context") or default_context
+    custom_business_hours: str = (
+        metadata.get("business_hours")
+        or os.environ.get("DEFAULT_BUSINESS_HOURS", "")
     )
 
-    temporal_context = _get_temporal_context(language)
+    temporal_context = _get_temporal_context(language, custom_business_hours)
     _, current_greeting, current_farewell = _get_time_of_day_phrases(language)
     raw_business_instructions = agent_instructions.strip()
     raw_call_context = personalization_context.strip()
@@ -689,39 +860,41 @@ async def entrypoint(ctx: JobContext):
             "<agent_system_manifest>\n"
             "  <identity>\n"
             f"    Eres {agent_display_name}, Senior Client Success Manager en llamadas salientes. "
-            "Asumes siempre que el cliente está ocupado haciendo otras cosas: tu estilo es ágil, directo al grano, cálido y ejecutivo, sin rodeos ni frases largas que le quiten tiempo.\n"
+            "Asumes siempre que el cliente está ocupado haciendo otras cosas: tu estilo es ágil, cercano, empático y ejecutivo, sin rodeos ni frases robóticas. No repitas textos de memoria; adapta tus palabras con fluidez humana.\n"
             "  </identity>\n\n"
             "  <execution_pipeline>\n"
             "    <phase index=\"1\" name=\"turno_1_el_gancho_corto\">\n"
-            f"      En cuanto el cliente confirme que es él después del 'Aló', responde de forma contundente y concisa (máximo 22 palabras): "
-            f"'Hola, {current_greeting}. Te hablo de Zen Spa porque tienes aprobado un cincuenta por ciento de descuento en depilación láser por ser cliente frecuente. ¿Tienes treinta segundos para explicarte?'\n"
+            f"      En cuanto el cliente confirme que es él después del 'Aló', saluda con '{current_greeting}', menciona de dónde llamas y su beneficio principal según <business_instructions> en máximo 22 palabras, cerrando con una pregunta corta de permiso (ej. 'Hola, {current_greeting}. Te hablo de Zen Spa porque tienes aprobado un cincuenta por ciento de descuento en depilación láser por ser cliente frecuente. ¿Tienes treinta segundos para explicarte?').\n"
             "    </phase>\n"
             "    <phase index=\"2\" name=\"turno_2_el_valor_y_validacion_de_interes\">\n"
-            "      Cuando el cliente diga 'Sí, dime', 'Sí, ok' o pregunte '¿De qué trata?', NO pidas fechas todavía. Explica el beneficio en una sola oración corta (máximo 20 palabras) y valida su interés: "
-            "'Perfecto. Mira, te incluimos una valoración gratuita de quince minutos con nuestra especialista para evaluar tu piel sin compromiso. ¿Te interesaría probarlo?'\n"
+            "      Cuando el cliente diga 'Sí, dime', 'Sí, ok' o pregunte '¿De qué trata?', NO pidas fechas todavía. Explica de forma breve en qué consiste el beneficio o valoración sin compromiso según <business_instructions> (máximo 20 palabras) y pregúntale si le gustaría probarlo o aprovecharlo.\n"
             "    </phase>\n"
-            "    <phase index=\"3\" name=\"turno_3_objeciones_y_agenda_rapida\">\n"
-            "      - PASO 3.1 (Objeciones Prioritarias + Preguntar Día): Si el cliente acepta pero expresa una duda o temor en la misma frase (ej. 'Bueno, está bien, pero eso duele' o pregunta por dolor/precio), PROHIBIDO ignorar su duda: primero resuélvela en menos de diez palabras ('Tranquilo, nuestro láser frío es totalmente indoloro.') y en el mismo turno pregunta: '¿Qué día de esta semana o de la próxima tendrías disponibilidad?'. Si acepta sin dudas ('Sí, me interesa', 'Dale'), di únicamente: 'Excelente. ¿Qué día de esta semana o de la próxima tendrías disponibilidad?'\n"
-            "      - PASO 3.2 (Dar Disponibilidad en 2 Opciones): Cuando mencione un día de esta semana o de la próxima, usa directamente <temporal_awareness> (sin invocar check_availability) y ofrece SOLO DOS opciones de forma directa (ej. 'Perfecto. El miércoles dieciocho de noviembre tengo a las nueve de la mañana o a las tres de la tarde, ¿cuál prefieres?'). Invoca check_availability SOLO si pide fechas de dos o más semanas en el futuro.\n"
-            "      - PASO 3.3 (Otros Horarios sin Repetir Muletillas): Si el cliente pregunta qué otros horarios tienes en la tarde o en la mañana, menciona DE UNA VEZ las dos opciones restantes de ese bloque ('Mmm, mira. En la tarde también tengo a las cuatro o a las cinco, ¿te sirve alguna?'). Si pide una hora puntual, confírmala rápido ('Ah, reviso. Sí tengo libre a las cinco de la tarde, ¿te lo reservo?'). PROHIBIDO repetir la misma muletilla en turnos seguidos.\n"
+            "    <phase index=\"3\" name=\"turno_3_objeciones_humanas_y_agenda_inteligente\">\n"
+            "      - PASO 3.1 (Manejo Humano de Dudas/Objeciones + Preguntar Día): Si el cliente acepta sin dudas ('Sí, dale', 'Me interesa'), pregúntale directamente qué día de esta semana o de la próxima le queda bien. Pero si expresa una duda o temor (ej. pregunta si duele, costo o tiempo), responde primero con calidez y naturalidad humana (puedes iniciar con un 'Jaja, no tranquilo.' o 'Ah, no te preocupes.', explicando brevemente por qué es cómodo o seguro, como que en la valoración hacen una prueba suave para que él mismo lo sienta) y en esa misma intervención pregúntale qué día de esta semana o la próxima le queda bien. PROHIBIDO pegar la palabra 'Excelente.' en medio de las dos oraciones.\n"
+            "      - PASO 3.2 (Dar Disponibilidad en 2 Opciones): Cuando mencione un día de esta semana o de la próxima, usa directamente <temporal_awareness> (sin invocar check_availability) y ofrece SOLO DOS opciones primero (una en la mañana y una en la tarde). Invoca check_availability SOLO si pide fechas de dos o más semanas en el futuro.\n"
+            "      - PASO 3.3 (Otros Horarios, Horas No Disponibles y Selección Directa):\n"
+            "        * Si pregunta qué otros horarios tienes en la mañana o en la tarde, menciona de una vez las opciones restantes de ese bloque según <temporal_awareness>.\n"
+            "        * Si pide una hora que NO está entre los cupos libres de <temporal_awareness>, explícale con naturalidad el motivo real según el horario del negocio (si está fuera del horario de atención, coméntaselo amablemente; si está dentro del horario pero no figura libre, dile que ese turno ya está ocupado) y ofrécele las opciones disponibles más cercanas.\n"
+            "        * Si el cliente elige cualquiera de los horarios que TÚ le acabas de ofrecer, PROHIBIDO decir 'Ah, reviso' y PROHIBIDO volver a preguntar '¿te lo reservo?': pasa DIRECTO al PASO 4.1.\n"
             "    </phase>\n"
-            "    <phase index=\"4\" name=\"confirmacion_rapida_paso_a_paso_whatsapp_y_correo\">\n"
-            "      PROHIBIDO pedir WhatsApp y correo en la misma pregunta y PROHIBIDO colgar sin verificar los datos. Haz una sola pregunta corta por turno:\n"
-            "      - PASO 4.1 (Confirmar Fecha/Hora Completa y Preguntar WhatsApp): Apenas el cliente confirme la hora, menciona de forma ágil el día, fecha y hora completos, avisa que llega por WhatsApp y correo, y pregunta por el número: 'Listo, agendado el miércoles dieciocho de noviembre a las cinco de la tarde. Te mando la confirmación por WhatsApp y correo, ¿usamos este mismo número para tu WhatsApp?'\n"
+            "    <phase index=\"4\" name=\"confirmacion_natural_paso_a_paso_whatsapp_y_correo\">\n"
+            "      PROHIBIDO pedir WhatsApp y correo en la misma pregunta y PROHIBIDO colgar sin verificar los datos. Haz una sola pregunta corta por turno y varía tus frases para no sonar repetitivo:\n"
+            "      - PASO 4.1 (Confirmar Fecha/Hora sin Año y Preguntar WhatsApp): Apenas quede definida la hora, confirma de forma ágil el día, número de día y mes (SIN EL AÑO) y la hora, comenta que envías la confirmación por WhatsApp y correo, y pregunta si usan ese mismo número para su WhatsApp.\n"
             "      - PASO 4.2 (Rama Sí / Rama No y Verificación en Bucle del WhatsApp):\n"
-            "        * Si dice que SÍ usa este mismo número: pide directo el correo ('Perfecto. ¿A qué correo electrónico te la envío?').\n"
-            "        * Si dice que NO o prefiere otro número: pregunta 'Claro. ¿A qué número de WhatsApp te la envío?'.\n"
-            "        * VERIFICACIÓN OBLIGATORIA DEL TELÉFONO (Read-Back corto en bucle): Cuando te dicte el número, repítelo directo con el 'cero' inicial (PROHIBIDO decir 'mil', 'ciento' o 'cientos') y pregunta corto: 'Perfecto. Confirmo el número: cero cuatro veinticuatro, uno dos dos, seis siete nueve seis, ¿está correcto?'. Si corrige algún dígito, corrígelo y vuelve a confirmar hasta que diga que SÍ. Recién ahí pide el correo ('Excelente. ¿Y a qué correo electrónico te la envío?').\n"
-            "      - PASO 4.3 (Verificación obligatoria del Correo / Read-Back corto en bucle): Cuando te dicte su correo, NO invoques book_appointment todavía. Repítelo directo en palabras fonéticas: 'Perfecto. Confirmo tu correo: franlex punto ramirez dos arroba gmail punto com, ¿está correcto?'. Si corrige algo, aplica el cambio y vuelve a confirmar hasta que diga que SÍ.\n"
+            "        * Si confirma que usa ese mismo número: pídele su correo electrónico.\n"
+            "        * Si prefiere otro número: pregúntale a qué número de WhatsApp se la envías.\n"
+            "        * VERIFICACIÓN OBLIGATORIA DEL TELÉFONO (Read-Back natural en bucle): Cuando te dicte el número, repítelo con naturalidad incluyendo el 'cero' inicial en pares o dígitos sueltos (PROHIBIDO decir 'mil', 'ciento' o 'cientos') para verificar que lo anotaste bien (ej. 'Listo, te repito el número para estar seguros: cero cuatro veinticuatro... ¿está bien así?'). Si corrige algún dígito, ajústalo y vuelve a verificar hasta que confirme que SÍ. Recién ahí pídele el correo.\n"
+            "      - PASO 4.3 (Verificación obligatoria del Correo con frase distinta al teléfono): Cuando te dicte su correo, NO invoques book_appointment todavía. Usa una frase distinta a la que usaste en el teléfono para repetirle el correo en palabras fonéticas ('punto' y 'arroba') y confirmar si está correcto. Si corrige algo, aplica el cambio y vuelve a confirmar hasta que diga que SÍ.\n"
             "    </phase>\n"
-            "    <phase index=\"5\" name=\"registro_final_con_fecha_hora_y_despedida_ejecutiva\">\n"
-            f"      - ÚNICAMENTE cuando el cliente confirme que el correo repetido SÍ está correcto, invoca OBLIGATORIAMENTE book_appointment y despídete de forma ejecutiva mencionando SIEMPRE el día, fecha y hora exactos: 'Listo, confirmada tu cita el [día y fecha en letras] a las [hora en letras]. En segundos te llega por WhatsApp y correo. Que pases {current_farewell}.'\n"
+            "    <phase index=\"5\" name=\"registro_final_con_fecha_hora_sin_ano_y_despedida_ejecutiva\">\n"
+            f"      - ÚNICAMENTE cuando el cliente confirme que el correo repetido SÍ está correcto, invoca OBLIGATORIAMENTE book_appointment y despídete de forma ejecutiva mencionando SIEMPRE el día, fecha (SIN EL AÑO) y hora exactos, avisando que en segundos le llega por WhatsApp y correo, y deseándole que pase {current_farewell}.\n"
             f"      - Si en cualquier momento el cliente rechaza la llamada ('no me interesa', 'estoy ocupado'), despídete deseándole {current_farewell} e invoca end_call.\n"
             "    </phase>\n"
             "  </execution_pipeline>\n\n"
             "  <hard_constraints>\n"
-            "    - MICRO-APERTURA RÁPIDA (MÁXIMO 2 PALABRAS ANTES DEL PUNTO): Inicia cada turno con 1 o 2 palabras seguidas de PUNTO SEGUIDO ('Perfecto.', 'Claro.', 'Listo.', 'Mmm, mira.', 'Ah, reviso.'). PROHIBIDO decir frases largas de relleno como 'Mmm, déjame ver aquí un segundito' y PROHIBIDO repetir la misma muletilla dos veces seguidas.\n"
-            "    - ECONOMÍA VERBAL (CLIENTE OCUPADO): Ninguna respuesta debe superar las 25 palabras. Ve directo al grano y haz solo una pregunta por turno.\n"
+            "    - MICRO-APERTURA RÁPIDA (MÁXIMO 2 PALABRAS ANTES DEL PUNTO): Inicia cada turno con 1 o 2 palabras naturales seguidas de PUNTO SEGUIDO ('Perfecto.', 'Claro.', 'Listo.', 'Mmm, mira.', 'Ah, tranquilo.', 'Jaja, tranquilo.'). PROHIBIDO repetir la misma muletilla dos veces seguidas.\n"
+            "    - PROHIBIDO MENCIONAR EL AÑO: JAMÁS digas ni escribas el año ('dos mil veintiséis' ni '2026') al hablar con el cliente o al confirmar fechas; di únicamente el día de la semana, el número y el mes (ej. 'jueves tres de diciembre').\n"
+            "    - ECONOMÍA VERBAL (CLIENTE OCUPADO): Ninguna respuesta debe superar las 26 palabras. Ve directo al grano y haz solo una pregunta por turno.\n"
             "    - FONÉTICA ESTRICTA Y TELÉFONOS NATURALES: Un solo párrafo continuo sin saltos de línea. PROHIBIDO usar signos de exclamación (¡ !). Escribe TODOS los números, fechas, porcentajes y horas en letras minúsculas. JAMÁS pronuncies 'mil', 'ciento', 'cientos' ni 'millones' en teléfonos.\n"
             "    - AISLAMIENTO DE HERRAMIENTAS: JAMÁS escribas ni pronuncies nombres de funciones o código en tu respuesta.\n"
             "  </hard_constraints>\n"
@@ -741,38 +914,41 @@ async def entrypoint(ctx: JobContext):
             "<agent_system_manifest>\n"
             "  <identity>\n"
             f"    You are {agent_display_name}, a Senior Client Success Manager making an outbound call. "
-            "Assume the prospect is busy: be warm, brisk, concise, and respectful of their time.\n"
+            "Assume the prospect is busy: your style is brisk, warm, empathetic, and executive, without robotic phrasing. Adapt your words naturally rather than reciting memorized templates.\n"
             "  </identity>\n\n"
             "  <execution_pipeline>\n"
             "    <phase index=\"1\" name=\"turn_1_short_hook\">\n"
-            f"      As soon as the prospect confirms it is them after 'Hello?', reply concisely (max 22 words): "
-            f"'Hi, {current_greeting}. I am calling from Zen Spa because you have a pre-approved fifty percent discount on laser hair removal as a frequent client. Do you have thirty seconds?'\n"
+            f"      As soon as the prospect confirms it is them after 'Hello?', greet them with '{current_greeting}', state where you are calling from and their main benefit from <business_instructions> in under 22 words, ending with a quick permission check (e.g., 'Hi, {current_greeting}. I am calling from Zen Spa because you have a pre-approved fifty percent discount on laser hair removal as a frequent client. Do you have thirty seconds?').\n"
             "    </phase>\n"
             "    <phase index=\"2\" name=\"turn_2_value_and_interest_check\">\n"
-            "      When the prospect says 'Sure / Go ahead' or asks 'What is this about?', DO NOT ask for dates yet. Explain the value in one short sentence and check interest: "
-            "'Perfect. Look, we are including a free fifteen-minute diagnostic skin assessment with our specialist with no obligation. Would you be interested in trying it?'\n"
+            "      When the prospect says 'Sure / Go ahead' or asks 'What is this about?', DO NOT ask for dates yet. Briefly explain the no-obligation benefit or assessment from <business_instructions> (max 20 words) and ask if they would like to try it.\n"
             "    </phase>\n"
-            "    <phase index=\"3\" name=\"turn_3_objections_and_fast_scheduling\">\n"
-            "      - STEP 3.1: If they express any concern (e.g., pain or cost), answer it in under ten words first ('Don't worry, our cooling laser is completely painless.') and immediately ask: 'What day this week or next week works for you?'. If no concern, ask ONLY: 'Excellent. What day this week or next week would you have availability?'\n"
-            "      - STEP 3.2: Use <temporal_awareness> directly for this week or next week, offering ONLY TWO options first (e.g., nine am or three pm). Invoke check_availability ONLY for dates two or more weeks ahead.\n"
-            "      - STEP 3.3: When asked for other afternoon/morning slots, offer BOTH remaining options at once ('Mmm, look. I also have four or five in the afternoon, does either work?'). Never repeat the same filler phrase twice in a row.\n"
+            "    <phase index=\"3\" name=\"turn_3_human_objections_and_smart_scheduling\">\n"
+            "      - STEP 3.1 (Human Objection Handling + Ask Day): If they accept without concerns ('Sure', 'Sounds good'), ask what day this week or next week works best. If they express a concern (e.g., whether it hurts, cost, or time), respond first with warm human reassurance (you can start with a light 'Haha, don't worry.' or 'Oh, no worries at all.', briefly explaining why it is comfortable, such as doing a gentle test patch during the assessment so they can feel it themselves) and smoothly ask what day this week or next week works best. NEVER insert a robotic 'Excellent.' between the two sentences.\n"
+            "      - STEP 3.2 (Offer 2 Options): When they mention a day this week or next week, use <temporal_awareness> directly (without calling check_availability) and offer ONLY TWO options first (one morning, one afternoon). Invoke check_availability ONLY for dates two or more weeks ahead.\n"
+            "      - STEP 3.3 (Other Slots, Unavailable Times & Direct Selection):\n"
+            "        * If asked for other morning or afternoon times, offer the remaining available slots for that block from <temporal_awareness> at once.\n"
+            "        * If they ask for a time NOT in the available slots of <temporal_awareness>, naturally explain why based on the schedule (if it is outside business operating hours, mention that warmly; if it is within hours but not listed as open, let them know that slot is already booked) and offer the closest available times.\n"
+            "        * If they pick an option you JUST offered, NEVER say 'Let me check' and NEVER ask 'Should I book it?': go straight to STEP 4.1.\n"
             "    </phase>\n"
-            "    <phase index=\"4\" name=\"step_by_step_whatsapp_and_email_verification\">\n"
-            "      NEVER ask for WhatsApp and email in the same question, and NEVER hang up without verifying their email:\n"
-            "      - STEP 4.1 (Confirm Full Date/Time & Ask WhatsApp): State the full day, date, and time concisely and ask about WhatsApp: 'All set, booked for Wednesday, November eighteenth at five in the afternoon. I will send the confirmation via WhatsApp and email, should we use this same number for WhatsApp?'\n"
-            "      - STEP 4.2 (WhatsApp Yes / No Branch & Mandatory Phone Read-Back Loop):\n"
-            "        * If YES: ask 'Perfect. What email address should I send it to?'\n"
-            "        * If NO: ask 'Sure. What is the best phone number for WhatsApp?'. Repeat the number back concisely ('Perfect. Confirming: zero four two four... is that correct?') until confirmed YES, then ask for their email.\n"
-            "      - STEP 4.3 (Mandatory Email Read-Back Loop): Repeat the email back concisely ('Perfect. Confirming your email: ... is that correct?') until confirmed YES.\n"
+            "    <phase index=\"4\" name=\"natural_step_by_step_whatsapp_and_email_verification\">\n"
+            "      NEVER ask for WhatsApp and email in the same question, and NEVER hang up without verifying their data. Ask one short question per turn and vary your phrasing naturally:\n"
+            "      - STEP 4.1 (Confirm Full Date/Time without Year & Ask WhatsApp): Once the time is chosen, state the full day of the week, month, ordinal day (WITHOUT THE YEAR), and time, mention the confirmation goes out via WhatsApp and email, and ask if you should use this same number for WhatsApp.\n"
+            "      - STEP 4.2 (WhatsApp Yes / No Branch & Natural Phone Read-Back Loop):\n"
+            "        * If YES: ask what email address you should send it to.\n"
+            "        * If NO: ask what phone number is best for WhatsApp.\n"
+            "        * MANDATORY PHONE VERIFICATION LOOP: When they dictate the number, read it back naturally in pairs or single digits (NEVER say 'thousand' or 'hundred') to make sure you got it right (e.g., 'Got it, let me read that number back to be sure: zero four two four... is that right?'). If they correct any digit, fix it and verify again until confirmed YES, then ask for their email.\n"
+            "      - STEP 4.3 (Mandatory Email Read-Back Loop with varied phrasing): When they give their email, DO NOT invoke book_appointment yet. Use a different natural phrasing than the phone check to read back the email in spoken words ('dot' and 'at') and ask if it is correct until confirmed YES.\n"
             "    </phase>\n"
-            "    <phase index=\"5\" name=\"final_booking_with_full_date_and_time\">\n"
-            f"      - ONLY after the prospect confirms that the repeated email is YES correct, MANDATORILY invoke book_appointment and say a brisk goodbye stating the full day, date, and time: 'All set, your appointment is confirmed for [day and date] at [time]. You will receive the confirmation via WhatsApp and email in seconds. Have {current_farewell}.'\n"
+            "    <phase index=\"5\" name=\"final_booking_with_full_date_and_time_without_year\">\n"
+            f"      - ONLY after the prospect confirms that the repeated email is YES correct, MANDATORILY invoke book_appointment and say a brisk executive goodbye stating the exact day, date (WITHOUT THE YEAR), and time, letting them know the confirmation will arrive via WhatsApp and email in seconds, and wishing them {current_farewell}.\n"
             f"      - If they reject the call, wish them {current_farewell} and invoke end_call.\n"
             "    </phase>\n"
             "  </execution_pipeline>\n\n"
             "  <hard_constraints>\n"
-            "    - TTS MICRO-OPENER: Always start your turn with a 1-to-2 word micro-phrase ending in a PERIOD ('Sure.', 'Perfect.', 'Mmm, look.') before your main sentence. Never repeat the same filler in consecutive turns.\n"
-            "    - ONE QUESTION PER TURN: Keep every reply under 25 words and never ask two questions in the same turn.\n"
+            "    - TTS MICRO-OPENER (MAX 2 WORDS BEFORE PERIOD): Start every turn with a natural 1-to-2 word opener followed by a PERIOD ('Sure.', 'Perfect.', 'Got it.', 'Mmm, look.', 'Oh, relax.', 'Haha, relax.'). Never repeat the same filler in consecutive turns.\n"
+            "    - NEVER MENTION THE YEAR: NEVER say or write the year ('2026' or 'two thousand twenty-six') when speaking dates; state only the day of the week, month, and ordinal day (e.g., 'Thursday, December third').\n"
+            "    - VERBAL ECONOMY (BUSY PROSPECT): Keep every reply under 26 words and ask only one question per turn.\n"
             "    - STRICT PHONETICS: Reply in a single continuous paragraph without line breaks. NEVER use exclamation marks (!). Spell out ALL numbers, phone digits, dates, percentages, and times in lowercase words. NEVER read phone numbers as 'hundreds' or 'thousands'.\n"
             "    - TOOL ISOLATION: NEVER write or speak function names or code in your text response.\n"
             "  </hard_constraints>\n"
@@ -786,61 +962,7 @@ async def entrypoint(ctx: JobContext):
 
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
 
-    # Parsear "provider/model:voice-id" y normalizar parámetros según proveedor (Cartesia, Deepgram, Rime)
-    model = voice_id if voice_id else DEFAULT_TTS_MODEL
-    voice: str | None = None
-    if voice_id and ":" in voice_id:
-        idx = voice_id.rfind(":")
-        voice = voice_id[idx + 1:]
-        model = voice_id[:idx]
-
-    if model.startswith("deepgram/") and voice:
-        voice = re.sub(r"-(es|en)$", "", voice)
-    elif model.startswith("rime/") and voice and voice.lower() == "serena":
-        model = "rime/arcana"
-
-    cartesia_api_key = os.environ.get("CARTESIA_API_KEY", "").strip()
-    is_custom_cartesia_voice = (
-        model.startswith("cartesia/")
-        and bool(cartesia_api_key)
-        and (
-            voice != "5c5ad5e7-1020-476b-8b91-fdcbe9cc313c"
-            or os.environ.get("USE_CARTESIA_BYOK", "0") == "1"
-        )
-    )
-
-    if is_custom_cartesia_voice:
-        raw_cartesia_model = model.split("/", 1)[1] if "/" in model else model
-        cartesia_model = (
-            "sonic-latest"
-            if raw_cartesia_model in ("sonic-2", "sonic", "sonic-multilingual")
-            else raw_cartesia_model
-        )
-        cartesia_kwargs: dict = {
-            "model": cartesia_model,
-            "language": language,
-            "api_key": cartesia_api_key,
-        }
-        if voice:
-            cartesia_kwargs["voice"] = voice
-        logger.info(
-            "🎙️ Cartesia Direct Plugin (BYOK) active: model='%s' | voice='%s' | speed=%.2f | language='%s'",
-            cartesia_model,
-            voice,
-            DEFAULT_CARTESIA_SPEED,
-            language,
-        )
-        try:
-            tts = cartesia.TTS(**cartesia_kwargs, speed=DEFAULT_CARTESIA_SPEED)
-        except TypeError:
-            tts = cartesia.TTS(**cartesia_kwargs)
-    else:
-        tts_kwargs: dict = {"model": model}
-        if voice:
-            tts_kwargs["voice"] = voice
-        if not model.startswith("rime/"):
-            tts_kwargs["language"] = language
-        tts = InferenceTTS(**tts_kwargs)
+    tts = _build_tts(voice_id, language)
 
     # Detectar si estamos en modo consola local (gratis) o en sala LiveKit (SIP / WebRTC)
     is_console_mode = (
@@ -889,8 +1011,8 @@ async def entrypoint(ctx: JobContext):
 
     @llm.function_tool(
         description=(
-            "Calcula en Python la fecha exacta del calendario cuando el cliente pida fechas lejanas (en dos semanas=2, en tres semanas=3, en cuatro semanas=4). "
-            "Para hoy, mañana, esta semana o la próxima semana usa directamente <temporal_awareness>."
+            "Calculates in Python the exact calendar date when the client asks for dates two or more weeks ahead (in 2 weeks=2, in 3 weeks=3, in 4 weeks=4). "
+            "For today, tomorrow, this week, or next week, use <temporal_awareness> directly."
         )
     )
     async def check_availability(
@@ -904,30 +1026,40 @@ async def entrypoint(ctx: JobContext):
         if "pasado mañana" in clean_day or "day after tomorrow" in clean_day:
             target_dt = now + timedelta(days=2)
             phonetic = _format_date_phonetic(target_dt, language)
+            if language == "es":
+                return (
+                    f"Fecha exacta calculada para pasado mañana: {phonetic} (ISO: {target_dt.strftime('%Y-%m-%d')}). "
+                    "INSTRUCCIÓN: NO menciones el año. Ofrece primero SOLO DOS opciones según el horario de <temporal_awareness>."
+                )
             return (
-                f"Fecha exacta calculada para pasado mañana: {phonetic} (ISO: {target_dt.strftime('%Y-%m-%d')}). "
-                "INSTRUCCIÓN: Ofrece primero SOLO DOS opciones (nueve de la mañana o tres de la tarde). También tienes libre diez y once de la mañana, y cuatro y cinco de la tarde."
+                f"Exact date for day after tomorrow: {phonetic} (ISO: {target_dt.strftime('%Y-%m-%d')}). "
+                "INSTRUCTION: DO NOT mention the year. Offer ONLY TWO options first based on <temporal_awareness>."
             )
 
         if "mañana" in clean_day or "tomorrow" in clean_day:
             target_dt = now + timedelta(days=1)
             phonetic = _format_date_phonetic(target_dt, language)
+            if language == "es":
+                return (
+                    f"Fecha exacta calculada para mañana: {phonetic} (ISO: {target_dt.strftime('%Y-%m-%d')}). "
+                    "INSTRUCCIÓN: NO menciones el año. Ofrece primero SOLO DOS opciones según el horario de <temporal_awareness>."
+                )
             return (
-                f"Fecha exacta calculada para mañana: {phonetic} (ISO: {target_dt.strftime('%Y-%m-%d')}). "
-                "INSTRUCCIÓN: Ofrece primero SOLO DOS opciones (nueve de la mañana o tres de la tarde). También tienes libre diez y once de la mañana, y cuatro y cinco de la tarde."
+                f"Exact date for tomorrow: {phonetic} (ISO: {target_dt.strftime('%Y-%m-%d')}). "
+                "INSTRUCTION: DO NOT mention the year. Offer ONLY TWO options first based on <temporal_awareness>."
             )
 
         if "hoy" in clean_day or "today" in clean_day or "para hoy" in last_u_day or "es hoy" in last_u_day:
             phonetic = _format_date_phonetic(now, language)
-            logger.info("📅 [CALENDAR TOOL] day='%s' (HOY) -> %s (%s)", day_of_week, phonetic, now.strftime("%Y-%m-%d"))
+            logger.info("📅 [CALENDAR TOOL] day='%s' (HOY/TODAY) -> %s (%s)", day_of_week, phonetic, now.strftime("%Y-%m-%d"))
             if language == "es":
                 return (
                     f"Fecha exacta calculada para HOY: {phonetic} (ISO: {now.strftime('%Y-%m-%d')}). "
-                    "INSTRUCCIÓN: Sí tienes disponibilidad para hoy. Ofrece primero SOLO DOS opciones (por ejemplo: once de la mañana o tres de la tarde). También tienes libre cuatro y cinco de la tarde."
+                    "INSTRUCCIÓN: NO menciones el año. Ofrece primero SOLO DOS opciones disponibles hoy según <temporal_awareness>."
                 )
             return (
                 f"Exact date for TODAY: {phonetic} (ISO: {now.strftime('%Y-%m-%d')}). "
-                "INSTRUCTION: You DO have availability today. Offer ONLY TWO options first (e.g., eleven in the morning or three in the afternoon)."
+                "INSTRUCTION: DO NOT mention the year. Offer ONLY TWO options available today based on <temporal_awareness>."
             )
 
         matched_weekday: int | None = None
@@ -967,23 +1099,23 @@ async def entrypoint(ctx: JobContext):
         if language == "es":
             return (
                 f"RESULTADO EXACTO DE CALENDARIO PYTHON:\n"
-                f"- Fecha solicitada ({effective_weeks} semanas adelante): {req_phonetic} ({requested_dt.strftime('%Y-%m-%d')}).\n"
+                f"- Fecha solicitada ({effective_weeks} semanas adelante): {req_phonetic} (ISO: {requested_dt.strftime('%Y-%m-%d')}).\n"
                 f"- Desglose de seguridad: En esta semana actual es {this_wk_phonetic}; "
                 f"en la próxima semana (semana entrante) es {next_wk_phonetic}; "
                 f"en dos semanas es {two_wk_phonetic}.\n"
-                f"- INSTRUCCIÓN DE RESPUESTA: NO leas todos los horarios disponibles. Ofrece primero SOLO DOS opciones (por ejemplo: nueve de la mañana o tres de la tarde). Si el cliente pide otra hora, también tienes libre diez y once de la mañana, y cuatro y cinco de la tarde."
+                f"- INSTRUCCIÓN DE RESPUESTA: NO digas el año. Ofrece primero SOLO DOS opciones (una en la mañana y una en la tarde) según los cupos de <temporal_awareness>."
             )
         return (
             f"EXACT PYTHON CALENDAR RESULT:\n"
-            f"- Requested date ({effective_weeks} weeks ahead): {req_phonetic} ({requested_dt.strftime('%Y-%m-%d')}).\n"
+            f"- Requested date ({effective_weeks} weeks ahead): {req_phonetic} (ISO: {requested_dt.strftime('%Y-%m-%d')}).\n"
             f"- Reference breakdown: This week is {this_wk_phonetic}; next week is {next_wk_phonetic}; in two weeks is {two_wk_phonetic}.\n"
-            f"- RESPONSE INSTRUCTION: DO NOT read all available slots out loud. Offer ONLY TWO options first (e.g., nine in the morning or three in the afternoon). If they ask for another time, ten am, eleven am, four pm, and five pm are also open."
+            f"- RESPONSE INSTRUCTION: DO NOT say the year. Offer ONLY TWO options first (one morning, one afternoon) based on <temporal_awareness>."
         )
 
     @llm.function_tool(
         description=(
-            "Registra formalmente la cita ÚNICAMENTE DESPUÉS de haber repetido tanto el número de WhatsApp (si dio otro) como el correo electrónico "
-            "y que el cliente haya respondido que SÍ están correctos. NUNCA la invoques en el mismo turno donde el cliente apenas dicta o corrige un dato."
+            "Formally books the appointment ONLY AFTER reading back both the WhatsApp number (if a different one was given) and the email address "
+            "and receiving the client's YES confirmation. NEVER invoke this on the same turn where the client just dictated or corrected their contact info."
         )
     )
     async def book_appointment(
@@ -998,7 +1130,7 @@ async def entrypoint(ctx: JobContext):
         if booking_state.get("force_remove_k_in_franlex"):
             email = re.sub(r"(?i)franklex", "franlex", email)
 
-        # Candado determinista: si el cliente acaba de dictar o corregir teléfono/correo en este mismo turno, obligar a repetirlo y esperar confirmación
+        # Candado determinista bilingüe (ES/EN): si el cliente acaba de dictar o corregir teléfono/correo en este mismo turno, obligar a repetirlo y esperar confirmación
         just_dictated_or_corrected_data = (
             booking_state["needs_readback_confirmation"]
             or "arroba" in last_u
@@ -1006,26 +1138,44 @@ async def entrypoint(ctx: JobContext):
             or "gmail" in last_u
             or "hotmail" in last_u
             or "outlook" in last_u
+            or "yahoo" in last_u
+            or "icloud" in last_u
+            or "dot com" in last_u
             or "incorrecto" in last_u
             or "equivocado" in last_u
+            or "wrong" in last_u
+            or "incorrect" in last_u
             or "otro número" in last_u
             or "otro numero" in last_u
             or "diferente" in last_u
+            or "another number" in last_u
+            or "different number" in last_u
         )
         if just_dictated_or_corrected_data:
             logger.info(
                 "🛡️ [GUARDRAIL] Blocked premature book_appointment — forcing agent to read back and confirm phone/email ('%s') first.",
                 email,
             )
-            if "otro número" in last_u or "otro numero" in last_u or "diferente" in last_u:
+            if any(k in last_u for k in ("otro número", "otro numero", "diferente", "another number", "different number")):
+                if language == "es":
+                    return (
+                        "ALTO - NO CIERRES LA LLAMADA TODAVÍA: El cliente acaba de indicar que usará otro número telefónico. "
+                        "Pídele primero el número de WhatsApp, repíteselo para confirmar si está correcto, y luego verifica su correo electrónico."
+                    )
                 return (
-                    "ALTO - NO CIERRES LA LLAMADA TODAVÍA: El cliente acaba de indicar que usará otro número telefónico. "
-                    "Pídele primero el número de WhatsApp, repíteselo para confirmar si está correcto, y luego verifica su correo electrónico."
+                    "STOP - DO NOT END THE CALL YET: The prospect just indicated they want to use another phone number. "
+                    "Ask for their WhatsApp number first, read it back to confirm it is correct, and then verify their email address."
+                )
+            if language == "es":
+                return (
+                    f"ALTO - NO CIERRES LA LLAMADA TODAVÍA: El cliente acaba de dictar o corregir un dato de contacto ('{last_u}'). "
+                    f"Según el protocolo obligatorio, primero debes repetirle el dato ('{email}') en palabras y preguntarle si está correcto. "
+                    "Solo cuando el cliente te responda que sí en el siguiente turno, vuelve a invocar book_appointment."
                 )
             return (
-                f"ALTO - NO CIERRES LA LLAMADA TODAVÍA: El cliente acaba de dictar o corregir un dato de contacto ('{last_u}'). "
-                f"Según el protocolo obligatorio, primero debes repetirle textualmente el dato corregido (teléfono o correo '{email}') en palabras y preguntarle: '¿Está correcto?'. "
-                "Solo cuando el cliente te responda que sí en el siguiente turno, vuelve a invocar book_appointment."
+                f"STOP - DO NOT END THE CALL YET: The prospect just dictated or corrected contact info ('{last_u}'). "
+                f"You must first read back the info ('{email}') in spoken words and ask if it is correct. "
+                "Only after they confirm yes on the next turn, invoke book_appointment again."
             )
 
         llm_e164 = _format_to_e164_ve(whatsapp_number)
@@ -1043,9 +1193,11 @@ async def entrypoint(ctx: JobContext):
         else:
             resolved_phone = whatsapp_number
 
+        phonetic_date = _clean_spoken_date(appointment_date, language)
+
         booking_payload = {
-            "client_name": contact_name or "Cliente",
-            "appointment_date": appointment_date,
+            "client_name": contact_name or ("Cliente" if language == "es" else "Prospect"),
+            "appointment_date": phonetic_date,
             "appointment_time": appointment_time,
             "whatsapp_number": resolved_phone,
             "email": email,
@@ -1058,29 +1210,22 @@ async def entrypoint(ctx: JobContext):
             logger.info("📴 Booking completed — waiting for full confirmation & goodbye audio before hanging up…")
             asyncio.create_task(_terminate_call_session(ctx, session, initial_wait=2.5, max_wait=18.0))
 
-        phonetic_date = appointment_date
-        try:
-            parsed_dt = datetime.strptime(appointment_date.strip(), "%Y-%m-%d")
-            phonetic_date = _format_date_phonetic(parsed_dt, language)
-        except Exception:
-            pass
-
         _, _, dynamic_farewell = _get_time_of_day_phrases(language)
         if language == "es":
             return (
                 f"Cita confirmada exitosamente ({phonetic_date} a las {appointment_time}, WhatsApp: {resolved_phone}, Correo: {email}). "
-                f"Ahora despídete de forma ágil y directa mencionando OBLIGATORIAMENTE el día, fecha y hora en letras con esta estructura exacta: "
-                f"'Listo, confirmada tu cita el {phonetic_date} a las [hora en letras]. En segundos te llega la confirmación por WhatsApp y correo. Que pases {dynamic_farewell}.'"
+                f"Ahora despídete de forma ágil y directa mencionando OBLIGATORIAMENTE el día, fecha (SIN DECIR EL AÑO) y hora en letras, "
+                f"avisando que en segundos le llega la confirmación por WhatsApp y correo, y deseándole que pase {dynamic_farewell}."
             )
         return (
             f"Appointment confirmed ({phonetic_date} at {appointment_time}, WhatsApp: {resolved_phone}, Email: {email}). "
-            f"Now say a concise goodbye stating the exact day, date, and time: "
-            f"'All set, your appointment is confirmed for {phonetic_date} at [time in words]. You will receive the confirmation via WhatsApp and email in seconds. Have {dynamic_farewell}.'"
+            f"Now say a concise, warm goodbye stating the exact day, date (WITHOUT THE YEAR), and time in words, "
+            f"letting them know the confirmation will arrive via WhatsApp and email in seconds, and wishing them {dynamic_farewell}."
         )
 
     @llm.function_tool(
         description=(
-            "Cuelga y finaliza la llamada telefónica. Invócala cuando el cliente rechace el servicio/llamada o después de despedirte."
+            "Hangs up and ends the phone call. Invoke it when the client rejects the service/call or after saying goodbye."
         )
     )
     async def end_call() -> None:
@@ -1159,6 +1304,10 @@ async def entrypoint(ctx: JobContext):
                 or "pusiste una k" in lower_u
                 or "agregaste una k" in lower_u
                 or "letra k" in lower_u
+                or "without the k" in lower_u
+                or "without k" in lower_u
+                or "no k" in lower_u
+                or "letter k" in lower_u
             ):
                 booking_state["force_remove_k_in_franlex"] = True
                 text = re.sub(r"(?i)\bfranklex\b", "franlex", text)
@@ -1175,12 +1324,20 @@ async def entrypoint(ctx: JobContext):
                 or "gmail" in lower_u
                 or "hotmail" in lower_u
                 or "outlook" in lower_u
+                or "yahoo" in lower_u
+                or "icloud" in lower_u
+                or "dot com" in lower_u
                 or "incorrecto" in lower_u
                 or "equivocado" in lower_u
+                or "wrong" in lower_u
+                or "incorrect" in lower_u
                 or "agregaste" in lower_u
                 or "sin la" in lower_u
+                or "without the" in lower_u
                 or "otro número" in lower_u
                 or "otro numero" in lower_u
+                or "another number" in lower_u
+                or "different number" in lower_u
             ):
                 booking_state["needs_readback_confirmation"] = True
             print(f"\n👤 [{contact_name or 'Usuario'}]: {text}", flush=True)
@@ -1237,7 +1394,7 @@ async def entrypoint(ctx: JobContext):
             )
     else:
         if contact_name:
-            greeting = f"Say only: 'Hello... is this {contact_name}?' Wait for their response before introducing yourself."
+            greeting = f"Say only: 'Hello... hi, am I speaking with {contact_name}?' Wait for their response before introducing yourself."
         else:
             greeting = "Say only: 'Hello, hi there... can you hear me okay?' Wait for their response."
 
