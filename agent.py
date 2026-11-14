@@ -204,6 +204,49 @@ PHONE_HUNDREDS_TO_INT = {
 }
 VE_AREA_PREFIXES = ("412", "414", "424", "416", "426", "422", "2")
 
+MONTH_NAME_TO_INT = {
+    "enero": 1, "january": 1,
+    "febrero": 2, "february": 2,
+    "marzo": 3, "march": 3,
+    "abril": 4, "april": 4,
+    "mayo": 5, "may": 5,
+    "junio": 6, "june": 6,
+    "julio": 7, "july": 7,
+    "agosto": 8, "august": 8,
+    "septiembre": 9, "september": 9,
+    "octubre": 10, "october": 10,
+    "noviembre": 11, "november": 11,
+    "diciembre": 12, "december": 12,
+}
+DAY_WORD_TO_INT = {
+    **{v: k for k, v in NUMBERS_ES.items()},
+    **{v: k for k, v in NUMBERS_ORDINAL_EN.items()},
+    "primero": 1, "primer": 1, "veintiun": 21, "veintiún": 21,
+    "veintidos": 22, "veintitres": 23, "veintiseis": 26, "dieciseis": 16,
+}
+HOUR_WORD_TO_INT = {
+    "una": 1, "uno": 1, "one": 1,
+    "dos": 2, "two": 2,
+    "tres": 3, "three": 3,
+    "cuatro": 4, "four": 4,
+    "cinco": 5, "five": 5,
+    "seis": 6, "six": 6,
+    "siete": 7, "seven": 7,
+    "ocho": 8, "eight": 8,
+    "nueve": 9, "nine": 9,
+    "diez": 10, "ten": 10,
+    "once": 11, "eleven": 11,
+    "doce": 12, "twelve": 12,
+}
+HOURS_ES_WORDS = {
+    1: "una", 2: "dos", 3: "tres", 4: "cuatro", 5: "cinco", 6: "seis",
+    7: "siete", 8: "ocho", 9: "nueve", 10: "diez", 11: "once", 12: "doce",
+}
+HOURS_EN_WORDS = {
+    1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six",
+    7: "seven", 8: "eight", 9: "nine", 10: "ten", 11: "eleven", 12: "twelve",
+}
+
 
 def _format_to_e164_ve(raw_input: str) -> str:
     """Convierte cualquier teléfono venezolano (con o sin 0 inicial) al estándar internacional E.164 (+58...)."""
@@ -339,20 +382,131 @@ def _format_date_phonetic(dt: datetime, language: str) -> str:
     return f"{day_name_en}, {month_name_en} {day_ordinal_en}"
 
 
-def _clean_spoken_date(raw_date: str, language: str) -> str:
-    """Convierte fechas ISO a fonéticas y elimina cualquier mención al año ('de dos mil veintiséis' / '2026')."""
-    clean = raw_date.strip()
-    try:
-        parsed_dt = datetime.strptime(clean, "%Y-%m-%d")
-        return _format_date_phonetic(parsed_dt, language)
-    except Exception:
-        pass
-    clean = re.sub(
-        r"(?i)\s*(de\s+|del\s+|in\s+|of\s+)?(dos\s+mil\s+veint[a-záéíóú]+|two\s+thousand\s+twenty[\s-]*\w+|twenty\s+twenty[\s-]*\w+|202\d)\b",
-        "",
-        clean,
-    ).strip(" ,.")
-    return clean
+def _normalize_booking_datetime(
+    raw_date: str,
+    raw_time: str,
+    language: str,
+    fallback_iso_date: str = "",
+) -> tuple[str, str, str, str, str]:
+    """
+    Normaliza cualquier fecha y hora (ISO o en letras ES/EN) para Supabase y para TTS:
+    Devuelve: (iso_date 'YYYY-MM-DD', iso_time 'HH:MM:SS', iso_timestamptz, spoken_date_no_year, spoken_time_words)
+    """
+    tz = ZoneInfo("America/Caracas")
+    now = datetime.now(tz)
+    clean_d = raw_date.strip()
+    target_dt: datetime | None = None
+
+    # 1. Intentar parsear si viene en formato ISO YYYY-MM-DD
+    iso_match = re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})", clean_d)
+    if iso_match:
+        try:
+            target_dt = datetime(
+                int(iso_match.group(1)),
+                int(iso_match.group(2)),
+                int(iso_match.group(3)),
+                tzinfo=tz,
+            )
+        except ValueError:
+            target_dt = None
+
+    # 2. Si viene en letras ("jueves tres de diciembre", "Thursday, December third"), extraer mes y día
+    if target_dt is None:
+        lower_d = re.sub(
+            r"(?i)\s*(de\s+|del\s+|in\s+|of\s+)?(dos\s+mil\s+veint[a-záéíóú]+|two\s+thousand\s+twenty[\s-]*\w+|twenty\s+twenty[\s-]*\w+|202\d)\b",
+            "",
+            clean_d.lower(),
+        )
+        detected_month: int | None = None
+        for m_name, m_val in MONTH_NAME_TO_INT.items():
+            if m_name in lower_d:
+                detected_month = m_val
+                break
+
+        detected_day: int | None = None
+        if "treinta y uno" in lower_d or "thirty-first" in lower_d:
+            detected_day = 31
+        else:
+            num_match = re.search(r"\b([12]?\d|3[01])(?:st|nd|rd|th)?\b", lower_d)
+            if num_match:
+                detected_day = int(num_match.group(1))
+            else:
+                for token in re.findall(r"[a-záéíóúñ-]+", lower_d):
+                    if token in DAY_WORD_TO_INT:
+                        detected_day = DAY_WORD_TO_INT[token]
+                        break
+
+        if detected_month and detected_day:
+            year = now.year
+            if detected_month < now.month or (detected_month == now.month and detected_day < now.day):
+                year += 1
+            try:
+                target_dt = datetime(year, detected_month, detected_day, tzinfo=tz)
+            except ValueError:
+                target_dt = None
+
+    # 3. Respaldo con la última fecha consultada en check_availability o fecha siguiente
+    if target_dt is None and fallback_iso_date:
+        try:
+            parsed_fb = datetime.strptime(fallback_iso_date, "%Y-%m-%d")
+            target_dt = datetime(parsed_fb.year, parsed_fb.month, parsed_fb.day, tzinfo=tz)
+        except ValueError:
+            target_dt = None
+
+    if target_dt is None:
+        target_dt = now + timedelta(days=1)
+
+    # 4. Parsear la hora ("11:00", "17:00", "once de la mañana", "three in the afternoon")
+    lower_t = raw_time.strip().lower()
+    hour_24 = 9
+    minute_val = 0
+
+    hhmm_match = re.search(r"(\d{1,2}):(\d{2})", lower_t)
+    if hhmm_match:
+        hour_24 = int(hhmm_match.group(1))
+        minute_val = int(hhmm_match.group(2))
+    else:
+        digit_h = re.search(r"\b(\d{1,2})\b", lower_t)
+        if digit_h:
+            hour_24 = int(digit_h.group(1))
+        else:
+            for tok in re.findall(r"[a-záéíóúñ]+", lower_t):
+                if tok in HOUR_WORD_TO_INT:
+                    hour_24 = HOUR_WORD_TO_INT[tok]
+                    break
+
+    is_pm = any(k in lower_t for k in ("pm", "p.m", "tarde", "noche", "afternoon", "evening"))
+    is_am = any(k in lower_t for k in ("am", "a.m", "mañana", "morning"))
+    if is_pm and hour_24 < 12:
+        hour_24 += 12
+    elif is_am and hour_24 == 12:
+        hour_24 = 0
+    elif not is_am and not is_pm and 1 <= hour_24 <= 6:
+        hour_24 += 12
+
+    combined_dt = datetime(
+        target_dt.year,
+        target_dt.month,
+        target_dt.day,
+        hour_24,
+        minute_val,
+        0,
+        tzinfo=tz,
+    )
+    iso_date_str = combined_dt.strftime("%Y-%m-%d")
+    iso_time_str = combined_dt.strftime("%H:%M:%S")
+    iso_full_str = combined_dt.isoformat()
+
+    spoken_date_str = _format_date_phonetic(combined_dt, language)
+    hour_12 = hour_24 % 12 or 12
+    if language == "es":
+        period_es = "de la mañana" if hour_24 < 12 else ("de la tarde" if hour_24 < 19 else "de la noche")
+        spoken_time_str = f"{HOURS_ES_WORDS.get(hour_12, str(hour_12))} {period_es}"
+    else:
+        period_en = "in the morning" if hour_24 < 12 else ("in the afternoon" if hour_24 < 19 else "in the evening")
+        spoken_time_str = f"{HOURS_EN_WORDS.get(hour_12, str(hour_12))} {period_en}"
+
+    return iso_date_str, iso_time_str, iso_full_str, spoken_date_str, spoken_time_str
 
 
 def _get_time_of_day_phrases(language: str) -> tuple[str, str, str]:
@@ -385,8 +539,8 @@ def _get_temporal_context(language: str, custom_schedule: str = "") -> str:
         dt_this = monday_this_week + timedelta(days=d_idx)
         dt_next = monday_this_week + timedelta(weeks=1, days=d_idx)
         if dt_this.date() >= now.date():
-            this_week_items.append(f"{_format_date_phonetic(dt_this, language)} ({dt_this.strftime('%Y-%m-%d')})")
-        next_week_items.append(f"{_format_date_phonetic(dt_next, language)} ({dt_next.strftime('%Y-%m-%d')})")
+            this_week_items.append(f"{_format_date_phonetic(dt_this, language)} [ISO: {dt_this.strftime('%Y-%m-%d')}]")
+        next_week_items.append(f"{_format_date_phonetic(dt_next, language)} [ISO: {dt_next.strftime('%Y-%m-%d')}]")
 
     hour_12 = now.hour % 12 or 12
 
@@ -397,9 +551,9 @@ def _get_temporal_context(language: str, custom_schedule: str = "") -> str:
             "en la tarde tres, cuatro y cinco de la tarde."
         )
         return (
-            f"Ahora mismo (HOY) es {_format_date_phonetic(now, 'es')} ({now.strftime('%Y-%m-%d')}), {hour_12}:{now.minute:02d} {period}. "
-            f"MAÑANA es {_format_date_phonetic(tomorrow, 'es')} ({tomorrow.strftime('%Y-%m-%d')}). "
-            f"PASADO MAÑANA es {_format_date_phonetic(day_after, 'es')} ({day_after.strftime('%Y-%m-%d')}). "
+            f"Ahora mismo (HOY) es {_format_date_phonetic(now, 'es')} [ISO: {now.strftime('%Y-%m-%d')}], {hour_12}:{now.minute:02d} {period}. "
+            f"MAÑANA es {_format_date_phonetic(tomorrow, 'es')} [ISO: {tomorrow.strftime('%Y-%m-%d')}]. "
+            f"PASADO MAÑANA es {_format_date_phonetic(day_after, 'es')} [ISO: {day_after.strftime('%Y-%m-%d')}]. "
             f"Días restantes de ESTA SEMANA: {'; '.join(this_week_items)}. "
             f"Días de LA PRÓXIMA SEMANA (semana entrante): {'; '.join(next_week_items)}. "
             f"{schedule_es} "
@@ -412,9 +566,9 @@ def _get_temporal_context(language: str, custom_schedule: str = "") -> str:
         "in the afternoon at three, four, and five in the afternoon."
     )
     return (
-        f"Right now (TODAY) is {_format_date_phonetic(now, 'en')} ({now.strftime('%Y-%m-%d')}), {hour_12}:{now.minute:02d} {period}. "
-        f"TOMORROW is {_format_date_phonetic(tomorrow, 'en')} ({tomorrow.strftime('%Y-%m-%d')}). "
-        f"DAY AFTER TOMORROW is {_format_date_phonetic(day_after, 'en')} ({day_after.strftime('%Y-%m-%d')}). "
+        f"Right now (TODAY) is {_format_date_phonetic(now, 'en')} [ISO: {now.strftime('%Y-%m-%d')}], {hour_12}:{now.minute:02d} {period}. "
+        f"TOMORROW is {_format_date_phonetic(tomorrow, 'en')} [ISO: {tomorrow.strftime('%Y-%m-%d')}]. "
+        f"DAY AFTER TOMORROW is {_format_date_phonetic(day_after, 'en')} [ISO: {day_after.strftime('%Y-%m-%d')}]. "
         f"Remaining days THIS WEEK: {'; '.join(this_week_items)}. "
         f"Days NEXT WEEK: {'; '.join(next_week_items)}. "
         f"{schedule_en} "
@@ -538,7 +692,7 @@ def _build_llm() -> llm.LLM:
 
 
 def _build_stt(language: str, contact_name: str = "") -> lk_stt.STT:
-    """Construye el motor STT (Oído) con Deepgram Directo (BYOK ~150ms) como primario y Cartesia STT como respaldo."""
+    """Construye el motor STT (Oído) con Deepgram Directo (BYOK ~150ms) incluyendo muletillas humanas y Cartesia STT como respaldo."""
     deepgram_api_key = os.environ.get("DEEPGRAM_API_KEY", "").strip()
     cartesia_api_key = os.environ.get("CARTESIA_API_KEY", "").strip()
     stt_lang = "es" if language == "es" else "en"
@@ -547,7 +701,20 @@ def _build_stt(language: str, contact_name: str = "") -> lk_stt.STT:
     backup_stt: lk_stt.STT | None = None
 
     if deepgram_api_key:
-        custom_terms = ["Franlex", "Ramírez", "Zen Spa", "Plexus Code", "gmail.com"]
+        custom_terms = [
+            "Franlex",
+            "Ramírez",
+            "Zen Spa",
+            "Plexus Code",
+            "gmail.com",
+            "mmm",
+            "eh",
+            "ajá",
+            "este",
+            "uh",
+            "um",
+            "hmm",
+        ]
         if contact_name and contact_name.strip() not in custom_terms:
             custom_terms.insert(0, contact_name.strip())
         for dg_kwargs in (
@@ -859,43 +1026,43 @@ async def entrypoint(ctx: JobContext):
             "</runtime_data>\n\n"
             "<agent_system_manifest>\n"
             "  <identity>\n"
-            f"    Eres {agent_display_name}, Senior Client Success Manager en llamadas salientes. "
-            "Asumes siempre que el cliente está ocupado haciendo otras cosas: tu estilo es ágil, cercano, empático y ejecutivo, sin rodeos ni frases robóticas. No repitas textos de memoria; adapta tus palabras con fluidez humana.\n"
+            f"    Eres {agent_display_name}, especialista de atención al cliente en llamadas salientes. "
+            "Asumes siempre que el cliente está ocupado haciendo otras cosas: tu ritmo es ágil, cercano, empático y ejecutivo, sin rodeos ni frases robóticas. JAMÁS uses términos en inglés como 'Senior Client Success Manager' al hablar en español.\n"
             "  </identity>\n\n"
             "  <execution_pipeline>\n"
-            "    <phase index=\"1\" name=\"turno_1_el_gancho_corto\">\n"
-            f"      En cuanto el cliente confirme que es él después del 'Aló', saluda con '{current_greeting}', menciona de dónde llamas y su beneficio principal según <business_instructions> en máximo 22 palabras, cerrando con una pregunta corta de permiso (ej. 'Hola, {current_greeting}. Te hablo de Zen Spa porque tienes aprobado un cincuenta por ciento de descuento en depilación láser por ser cliente frecuente. ¿Tienes treinta segundos para explicarte?').\n"
+            "    <phase index=\"1\" name=\"turno_1_presentacion_con_nombre_y_gancho_corto\">\n"
+            f"      En cuanto el cliente confirme que es él después del 'Aló', salúdalo por su nombre en 2 palabras seguidas de PUNTO SEGUIDO, preséntate siempre con tu nombre ({agent_display_name}) y la empresa de donde llamas, menciona su beneficio principal según <business_instructions> y cierra con una pregunta corta de permiso (máximo 25 palabras en total; por ejemplo: 'Hola, {client_label}. Te habla {agent_display_name}, de Zen Spa; te llamo porque tienes aprobado un cincuenta por ciento de descuento en depilación láser por ser cliente frecuente. ¿Tienes treinta segundos?').\n"
             "    </phase>\n"
             "    <phase index=\"2\" name=\"turno_2_el_valor_y_validacion_de_interes\">\n"
-            "      Cuando el cliente diga 'Sí, dime', 'Sí, ok' o pregunte '¿De qué trata?', NO pidas fechas todavía. Explica de forma breve en qué consiste el beneficio o valoración sin compromiso según <business_instructions> (máximo 20 palabras) y pregúntale si le gustaría probarlo o aprovecharlo.\n"
+            "      Cuando el cliente diga 'Sí, dime', 'Sí, ok' o pregunte '¿De qué trata?', NO pidas fechas todavía. Abre con una expresión humana natural ('Ah, mira.', 'Mmm, te cuento.') y explica brevemente en qué consiste el beneficio o valoración sin compromiso según <business_instructions> (máximo 20 palabras), preguntando si le gustaría aprovecharlo.\n"
             "    </phase>\n"
-            "    <phase index=\"3\" name=\"turno_3_objeciones_humanas_y_agenda_inteligente\">\n"
-            "      - PASO 3.1 (Manejo Humano de Dudas/Objeciones + Preguntar Día): Si el cliente acepta sin dudas ('Sí, dale', 'Me interesa'), pregúntale directamente qué día de esta semana o de la próxima le queda bien. Pero si expresa una duda o temor (ej. pregunta si duele, costo o tiempo), responde primero con calidez y naturalidad humana (puedes iniciar con un 'Jaja, no tranquilo.' o 'Ah, no te preocupes.', explicando brevemente por qué es cómodo o seguro, como que en la valoración hacen una prueba suave para que él mismo lo sienta) y en esa misma intervención pregúntale qué día de esta semana o la próxima le queda bien. PROHIBIDO pegar la palabra 'Excelente.' en medio de las dos oraciones.\n"
-            "      - PASO 3.2 (Dar Disponibilidad en 2 Opciones): Cuando mencione un día de esta semana o de la próxima, usa directamente <temporal_awareness> (sin invocar check_availability) y ofrece SOLO DOS opciones primero (una en la mañana y una en la tarde). Invoca check_availability SOLO si pide fechas de dos o más semanas en el futuro.\n"
+            "    <phase index=\"3\" name=\"turno_3_objeciones_humanas_y_agenda_con_muletillas\">\n"
+            "      - PASO 3.1 (Manejo Humano de Dudas/Objeciones + Preguntar Día): Si el cliente acepta sin dudas ('Sí, dale', 'Me interesa'), pregúntale qué día de esta semana o de la próxima le queda bien. Si expresa una duda o temor (ej. pregunta si duele, si es gratis o cuánto dura), responde primero con calidez y naturalidad humana ('Jaja, no tranquilo.', 'Ah, no te preocupes.', 'Mmm, sí claro, es totalmente sin costo.') y en esa misma intervención pregúntale qué día de esta semana o la próxima le queda bien. PROHIBIDO pegar 'Excelente.' en medio de las dos oraciones.\n"
+            "      - PASO 3.2 (Dar Disponibilidad con Muletillas Humanas en 2 Opciones): Cuando el cliente mencione un día o pida buscar disponibilidad, abre con una muletilla humana pensativa ('Mmm, veamos.', 'Eh, mira.', 'Mmm, déjame ver.') y ofrece SOLO DOS opciones primero (una en la mañana y una en la tarde) usando <temporal_awareness> para esta semana o la próxima, o check_availability si es de dos o más semanas en el futuro.\n"
             "      - PASO 3.3 (Otros Horarios, Horas No Disponibles y Selección Directa):\n"
-            "        * Si pregunta qué otros horarios tienes en la mañana o en la tarde, menciona de una vez las opciones restantes de ese bloque según <temporal_awareness>.\n"
+            "        * Si pregunta qué otros horarios tienes en la mañana o en la tarde, abre con una muletilla natural ('Mmm, mira.', 'Eh, en la mañana...') y menciona de una vez las opciones restantes de ese bloque según <temporal_awareness>.\n"
             "        * Si pide una hora que NO está entre los cupos libres de <temporal_awareness>, explícale con naturalidad el motivo real según el horario del negocio (si está fuera del horario de atención, coméntaselo amablemente; si está dentro del horario pero no figura libre, dile que ese turno ya está ocupado) y ofrécele las opciones disponibles más cercanas.\n"
-            "        * Si el cliente elige cualquiera de los horarios que TÚ le acabas de ofrecer, PROHIBIDO decir 'Ah, reviso' y PROHIBIDO volver a preguntar '¿te lo reservo?': pasa DIRECTO al PASO 4.1.\n"
+            "        * Si el cliente elige cualquiera de los horarios que TÚ le acabas de ofrecer, pasa DIRECTO al PASO 4.1 sin volver a preguntar '¿te lo reservo?'.\n"
             "    </phase>\n"
             "    <phase index=\"4\" name=\"confirmacion_natural_paso_a_paso_whatsapp_y_correo\">\n"
             "      PROHIBIDO pedir WhatsApp y correo en la misma pregunta y PROHIBIDO colgar sin verificar los datos. Haz una sola pregunta corta por turno y varía tus frases para no sonar repetitivo:\n"
             "      - PASO 4.1 (Confirmar Fecha/Hora sin Año y Preguntar WhatsApp): Apenas quede definida la hora, confirma de forma ágil el día, número de día y mes (SIN EL AÑO) y la hora, comenta que envías la confirmación por WhatsApp y correo, y pregunta si usan ese mismo número para su WhatsApp.\n"
-            "      - PASO 4.2 (Rama Sí / Rama No y Verificación en Bucle del WhatsApp):\n"
+            "      - PASO 4.2 (Rama Sí / Rama No y Verificación en Bucle del WhatsApp con Pausas):\n"
             "        * Si confirma que usa ese mismo número: pídele su correo electrónico.\n"
             "        * Si prefiere otro número: pregúntale a qué número de WhatsApp se la envías.\n"
-            "        * VERIFICACIÓN OBLIGATORIA DEL TELÉFONO (Read-Back natural en bucle): Cuando te dicte el número, repítelo con naturalidad incluyendo el 'cero' inicial en pares o dígitos sueltos (PROHIBIDO decir 'mil', 'ciento' o 'cientos') para verificar que lo anotaste bien (ej. 'Listo, te repito el número para estar seguros: cero cuatro veinticuatro... ¿está bien así?'). Si corrige algún dígito, ajústalo y vuelve a verificar hasta que confirme que SÍ. Recién ahí pídele el correo.\n"
-            "      - PASO 4.3 (Verificación obligatoria del Correo con frase distinta al teléfono): Cuando te dicte su correo, NO invoques book_appointment todavía. Usa una frase distinta a la que usaste en el teléfono para repetirle el correo en palabras fonéticas ('punto' y 'arroba') y confirmar si está correcto. Si corrige algo, aplica el cambio y vuelve a confirmar hasta que diga que SÍ.\n"
+            "        * VERIFICACIÓN OBLIGATORIA DEL TELÉFONO (Con comas obligatorias entre bloques): Cuando te dicte el número, repítelo con naturalidad incluyendo el 'cero' inicial y SEPARANDO SIEMPRE CON COMAS los bloques de dígitos para hacer pausas naturales (ej. 'Ah, perfecto. Te repito el número: cero cuatro veinticuatro, uno dos dos, seis siete nueve seis, ¿está bien así?'). PROHIBIDO decir 'mil', 'ciento' o 'cientos'. Si corrige algún dígito, ajústalo y vuelve a verificar hasta que confirme que SÍ. Recién ahí pídele el correo.\n"
+            "      - PASO 4.3 (Verificación obligatoria del Correo con frase distinta al teléfono): Cuando te dicte su correo, NO invoques book_appointment todavía. Usa una frase distinta a la que usaste en el teléfono para repetirle el correo en palabras fonéticas ('punto' y 'arroba') y confirmar si está correcto.\n"
             "    </phase>\n"
             "    <phase index=\"5\" name=\"registro_final_con_fecha_hora_sin_ano_y_despedida_ejecutiva\">\n"
-            f"      - ÚNICAMENTE cuando el cliente confirme que el correo repetido SÍ está correcto, invoca OBLIGATORIAMENTE book_appointment y despídete de forma ejecutiva mencionando SIEMPRE el día, fecha (SIN EL AÑO) y hora exactos, avisando que en segundos le llega por WhatsApp y correo, y deseándole que pase {current_farewell}.\n"
+            f"      - ÚNICAMENTE cuando el cliente confirme que el correo repetido SÍ está correcto, invoca OBLIGATORIAMENTE book_appointment (pasando appointment_date en formato ISO YYYY-MM-DD y appointment_time en formato 24h HH:MM) y despídete de forma ejecutiva mencionando SIEMPRE el día, fecha (SIN EL AÑO) y hora exactos en letras, avisando que en segundos le llega por WhatsApp y correo, y deseándole que pase {current_farewell}.\n"
             f"      - Si en cualquier momento el cliente rechaza la llamada ('no me interesa', 'estoy ocupado'), despídete deseándole {current_farewell} e invoca end_call.\n"
             "    </phase>\n"
             "  </execution_pipeline>\n\n"
             "  <hard_constraints>\n"
-            "    - MICRO-APERTURA RÁPIDA (MÁXIMO 2 PALABRAS ANTES DEL PUNTO): Inicia cada turno con 1 o 2 palabras naturales seguidas de PUNTO SEGUIDO ('Perfecto.', 'Claro.', 'Listo.', 'Mmm, mira.', 'Ah, tranquilo.', 'Jaja, tranquilo.'). PROHIBIDO repetir la misma muletilla dos veces seguidas.\n"
-            "    - PROHIBIDO MENCIONAR EL AÑO: JAMÁS digas ni escribas el año ('dos mil veintiséis' ni '2026') al hablar con el cliente o al confirmar fechas; di únicamente el día de la semana, el número y el mes (ej. 'jueves tres de diciembre').\n"
+            "    - MICRO-APERTURAS HUMANAS Y VARIADAS (MÁXIMO 2 PALABRAS ANTES DEL PUNTO): Inicia cada turno con 1 o 2 palabras seguidas de PUNTO SEGUIDO. Alterna expresiones humanas naturales ('Mmm, mira.', 'Eh, veamos.', 'Ah, claro.', 'Mmm, déjame ver.', 'Jaja, tranquilo.', 'Listo.') en lugar de repetir 'Claro.' o 'Perfecto.' en todos los turnos.\n"
+            "    - PROHIBIDO MENCIONAR EL AÑO AL HABLAR: JAMÁS digas el año ('dos mil veintiséis' ni '2026') en tu respuesta de voz; di únicamente el día de la semana, el número y el mes (ej. 'jueves tres de diciembre').\n"
             "    - ECONOMÍA VERBAL (CLIENTE OCUPADO): Ninguna respuesta debe superar las 26 palabras. Ve directo al grano y haz solo una pregunta por turno.\n"
-            "    - FONÉTICA ESTRICTA Y TELÉFONOS NATURALES: Un solo párrafo continuo sin saltos de línea. PROHIBIDO usar signos de exclamación (¡ !). Escribe TODOS los números, fechas, porcentajes y horas en letras minúsculas. JAMÁS pronuncies 'mil', 'ciento', 'cientos' ni 'millones' en teléfonos.\n"
+            "    - FONÉTICA ESTRICTA Y COMAS EN TELÉFONOS: Un solo párrafo continuo sin saltos de línea. PROHIBIDO usar signos de exclamación (¡ !). Escribe TODOS los números, fechas, porcentajes y horas en letras minúsculas. Al repetir teléfonos, separa SIEMPRE los bloques con comas ('cero cuatro veinticuatro, uno dos dos, seis siete nueve seis') y JAMÁS pronuncies 'mil', 'ciento', 'cientos' ni 'millones'.\n"
             "    - AISLAMIENTO DE HERRAMIENTAS: JAMÁS escribas ni pronuncies nombres de funciones o código en tu respuesta.\n"
             "  </hard_constraints>\n"
             "</agent_system_manifest>"
@@ -913,43 +1080,43 @@ async def entrypoint(ctx: JobContext):
             "</runtime_data>\n\n"
             "<agent_system_manifest>\n"
             "  <identity>\n"
-            f"    You are {agent_display_name}, a Senior Client Success Manager making an outbound call. "
+            f"    You are {agent_display_name}, a client success specialist making an outbound call. "
             "Assume the prospect is busy: your style is brisk, warm, empathetic, and executive, without robotic phrasing. Adapt your words naturally rather than reciting memorized templates.\n"
             "  </identity>\n\n"
             "  <execution_pipeline>\n"
-            "    <phase index=\"1\" name=\"turn_1_short_hook\">\n"
-            f"      As soon as the prospect confirms it is them after 'Hello?', greet them with '{current_greeting}', state where you are calling from and their main benefit from <business_instructions> in under 22 words, ending with a quick permission check (e.g., 'Hi, {current_greeting}. I am calling from Zen Spa because you have a pre-approved fifty percent discount on laser hair removal as a frequent client. Do you have thirty seconds?').\n"
+            "    <phase index=\"1\" name=\"turn_1_name_intro_and_short_hook\">\n"
+            f"      As soon as the prospect confirms it is them after 'Hello?', greet them by name in 2 words followed by a PERIOD, introduce yourself by name ({agent_display_name}) and the company you are calling from, state their main benefit from <business_instructions>, and end with a quick permission check (max 25 words total; e.g., 'Hi, {client_label}. This is {agent_display_name} from Zen Spa; I am calling because you have a pre-approved fifty percent discount on laser hair removal as a frequent client. Do you have thirty seconds?').\n"
             "    </phase>\n"
             "    <phase index=\"2\" name=\"turn_2_value_and_interest_check\">\n"
-            "      When the prospect says 'Sure / Go ahead' or asks 'What is this about?', DO NOT ask for dates yet. Briefly explain the no-obligation benefit or assessment from <business_instructions> (max 20 words) and ask if they would like to try it.\n"
+            "      When the prospect says 'Sure / Go ahead' or asks 'What is this about?', DO NOT ask for dates yet. Open with a natural human filler ('Oh, look.', 'Mmm, so basically.') and briefly explain the no-obligation benefit or assessment from <business_instructions> (max 20 words), asking if they would like to take advantage of it.\n"
             "    </phase>\n"
             "    <phase index=\"3\" name=\"turn_3_human_objections_and_smart_scheduling\">\n"
-            "      - STEP 3.1 (Human Objection Handling + Ask Day): If they accept without concerns ('Sure', 'Sounds good'), ask what day this week or next week works best. If they express a concern (e.g., whether it hurts, cost, or time), respond first with warm human reassurance (you can start with a light 'Haha, don't worry.' or 'Oh, no worries at all.', briefly explaining why it is comfortable, such as doing a gentle test patch during the assessment so they can feel it themselves) and smoothly ask what day this week or next week works best. NEVER insert a robotic 'Excellent.' between the two sentences.\n"
-            "      - STEP 3.2 (Offer 2 Options): When they mention a day this week or next week, use <temporal_awareness> directly (without calling check_availability) and offer ONLY TWO options first (one morning, one afternoon). Invoke check_availability ONLY for dates two or more weeks ahead.\n"
+            "      - STEP 3.1 (Human Objection Handling + Ask Day): If they accept without concerns ('Sure', 'Sounds good'), ask what day this week or next week works best. If they express a concern (e.g., whether it hurts, if it is free, or how long it takes), respond first with warm human reassurance ('Haha, don't worry.', 'Oh, no worries at all.', 'Mmm, yes, it is completely free.') and smoothly ask what day this week or next week works best. NEVER insert a robotic 'Excellent.' between the two sentences.\n"
+            "      - STEP 3.2 (Offer 2 Options with Human Fillers): When they mention a day or ask for availability, open with a thoughtful human filler ('Mmm, let's see.', 'Uh, look.', 'Mmm, let me check.') and offer ONLY TWO options first (one morning, one afternoon) using <temporal_awareness> for this week or next week, or calling check_availability for dates two or more weeks ahead.\n"
             "      - STEP 3.3 (Other Slots, Unavailable Times & Direct Selection):\n"
-            "        * If asked for other morning or afternoon times, offer the remaining available slots for that block from <temporal_awareness> at once.\n"
+            "        * If asked for other morning or afternoon times, open with a natural filler ('Mmm, look.', 'Uh, in the morning...') and offer the remaining available slots for that block from <temporal_awareness> at once.\n"
             "        * If they ask for a time NOT in the available slots of <temporal_awareness>, naturally explain why based on the schedule (if it is outside business operating hours, mention that warmly; if it is within hours but not listed as open, let them know that slot is already booked) and offer the closest available times.\n"
-            "        * If they pick an option you JUST offered, NEVER say 'Let me check' and NEVER ask 'Should I book it?': go straight to STEP 4.1.\n"
+            "        * If they pick an option you JUST offered, go straight to STEP 4.1 without asking 'Should I book it?'.\n"
             "    </phase>\n"
             "    <phase index=\"4\" name=\"natural_step_by_step_whatsapp_and_email_verification\">\n"
             "      NEVER ask for WhatsApp and email in the same question, and NEVER hang up without verifying their data. Ask one short question per turn and vary your phrasing naturally:\n"
             "      - STEP 4.1 (Confirm Full Date/Time without Year & Ask WhatsApp): Once the time is chosen, state the full day of the week, month, ordinal day (WITHOUT THE YEAR), and time, mention the confirmation goes out via WhatsApp and email, and ask if you should use this same number for WhatsApp.\n"
-            "      - STEP 4.2 (WhatsApp Yes / No Branch & Natural Phone Read-Back Loop):\n"
+            "      - STEP 4.2 (WhatsApp Yes / No Branch & Natural Phone Read-Back Loop with Commas):\n"
             "        * If YES: ask what email address you should send it to.\n"
             "        * If NO: ask what phone number is best for WhatsApp.\n"
-            "        * MANDATORY PHONE VERIFICATION LOOP: When they dictate the number, read it back naturally in pairs or single digits (NEVER say 'thousand' or 'hundred') to make sure you got it right (e.g., 'Got it, let me read that number back to be sure: zero four two four... is that right?'). If they correct any digit, fix it and verify again until confirmed YES, then ask for their email.\n"
+            "        * MANDATORY PHONE VERIFICATION LOOP (With mandatory commas between digit groups): When they dictate the number, read it back naturally separating digit groups with COMMAS for natural pauses (NEVER say 'thousand' or 'hundred', e.g., 'Ah, got it. Let me read that back: zero four two four, one two two, six seven nine six, does that sound right?'). If they correct any digit, fix it and verify again until confirmed YES, then ask for their email.\n"
             "      - STEP 4.3 (Mandatory Email Read-Back Loop with varied phrasing): When they give their email, DO NOT invoke book_appointment yet. Use a different natural phrasing than the phone check to read back the email in spoken words ('dot' and 'at') and ask if it is correct until confirmed YES.\n"
             "    </phase>\n"
             "    <phase index=\"5\" name=\"final_booking_with_full_date_and_time_without_year\">\n"
-            f"      - ONLY after the prospect confirms that the repeated email is YES correct, MANDATORILY invoke book_appointment and say a brisk executive goodbye stating the exact day, date (WITHOUT THE YEAR), and time, letting them know the confirmation will arrive via WhatsApp and email in seconds, and wishing them {current_farewell}.\n"
+            f"      - ONLY after the prospect confirms that the repeated email is YES correct, MANDATORILY invoke book_appointment (passing appointment_date in ISO YYYY-MM-DD format and appointment_time in 24h HH:MM format) and say a brisk executive goodbye stating the exact day, date (WITHOUT THE YEAR), and time in words, letting them know the confirmation will arrive via WhatsApp and email in seconds, and wishing them {current_farewell}.\n"
             f"      - If they reject the call, wish them {current_farewell} and invoke end_call.\n"
             "    </phase>\n"
             "  </execution_pipeline>\n\n"
             "  <hard_constraints>\n"
-            "    - TTS MICRO-OPENER (MAX 2 WORDS BEFORE PERIOD): Start every turn with a natural 1-to-2 word opener followed by a PERIOD ('Sure.', 'Perfect.', 'Got it.', 'Mmm, look.', 'Oh, relax.', 'Haha, relax.'). Never repeat the same filler in consecutive turns.\n"
-            "    - NEVER MENTION THE YEAR: NEVER say or write the year ('2026' or 'two thousand twenty-six') when speaking dates; state only the day of the week, month, and ordinal day (e.g., 'Thursday, December third').\n"
+            "    - HUMAN VARIED MICRO-OPENERS (MAX 2 WORDS BEFORE PERIOD): Start every turn with 1 or 2 natural words followed by a PERIOD. Alternate conversational human openers ('Mmm, look.', 'Uh, let's see.', 'Ah, gotcha.', 'Oh, no worries.', 'Haha, relax.', 'Got it.') instead of repeating 'Sure.' or 'Perfect.' on every turn.\n"
+            "    - NEVER MENTION THE YEAR OUT LOUD: NEVER say the year ('2026' or 'two thousand twenty-six') in your spoken reply; state only the day of the week, month, and ordinal day (e.g., 'Thursday, December third').\n"
             "    - VERBAL ECONOMY (BUSY PROSPECT): Keep every reply under 26 words and ask only one question per turn.\n"
-            "    - STRICT PHONETICS: Reply in a single continuous paragraph without line breaks. NEVER use exclamation marks (!). Spell out ALL numbers, phone digits, dates, percentages, and times in lowercase words. NEVER read phone numbers as 'hundreds' or 'thousands'.\n"
+            "    - STRICT PHONETICS & COMMAS IN PHONE NUMBERS: Reply in a single continuous paragraph without line breaks. NEVER use exclamation marks (!). Spell out ALL numbers, phone digits, dates, percentages, and times in lowercase words. Always separate phone digit groups with commas ('zero four two four, one two two, six seven nine six') and NEVER read phone numbers as 'hundreds' or 'thousands'.\n"
             "    - TOOL ISOLATION: NEVER write or speak function names or code in your text response.\n"
             "  </hard_constraints>\n"
             "</agent_system_manifest>"
@@ -1007,6 +1174,7 @@ async def entrypoint(ctx: JobContext):
         "needs_readback_confirmation": False,
         "extracted_phone_digits": "",
         "force_remove_k_in_franlex": False,
+        "last_checked_iso_date": "",
     }
 
     @llm.function_tool(
@@ -1025,41 +1193,47 @@ async def entrypoint(ctx: JobContext):
 
         if "pasado mañana" in clean_day or "day after tomorrow" in clean_day:
             target_dt = now + timedelta(days=2)
+            iso_d = target_dt.strftime("%Y-%m-%d")
+            booking_state["last_checked_iso_date"] = iso_d
             phonetic = _format_date_phonetic(target_dt, language)
             if language == "es":
                 return (
-                    f"Fecha exacta calculada para pasado mañana: {phonetic} (ISO: {target_dt.strftime('%Y-%m-%d')}). "
-                    "INSTRUCCIÓN: NO menciones el año. Ofrece primero SOLO DOS opciones según el horario de <temporal_awareness>."
+                    f"Fecha exacta calculada para pasado mañana: {phonetic} (ISO para base de datos: {iso_d}). "
+                    "INSTRUCCIÓN: Abre con una muletilla humana ('Mmm, mira.', 'Eh, veamos.'), NO menciones el año al hablar y ofrece SOLO DOS opciones según <temporal_awareness>."
                 )
             return (
-                f"Exact date for day after tomorrow: {phonetic} (ISO: {target_dt.strftime('%Y-%m-%d')}). "
-                "INSTRUCTION: DO NOT mention the year. Offer ONLY TWO options first based on <temporal_awareness>."
+                f"Exact date for day after tomorrow: {phonetic} (Database ISO: {iso_d}). "
+                "INSTRUCTION: Open with a human filler ('Mmm, look.', 'Uh, let's see.'), DO NOT mention the year out loud, and offer ONLY TWO options first based on <temporal_awareness>."
             )
 
         if "mañana" in clean_day or "tomorrow" in clean_day:
             target_dt = now + timedelta(days=1)
+            iso_d = target_dt.strftime("%Y-%m-%d")
+            booking_state["last_checked_iso_date"] = iso_d
             phonetic = _format_date_phonetic(target_dt, language)
             if language == "es":
                 return (
-                    f"Fecha exacta calculada para mañana: {phonetic} (ISO: {target_dt.strftime('%Y-%m-%d')}). "
-                    "INSTRUCCIÓN: NO menciones el año. Ofrece primero SOLO DOS opciones según el horario de <temporal_awareness>."
+                    f"Fecha exacta calculada para mañana: {phonetic} (ISO para base de datos: {iso_d}). "
+                    "INSTRUCCIÓN: Abre con una muletilla humana ('Mmm, mira.', 'Eh, veamos.'), NO menciones el año al hablar y ofrece SOLO DOS opciones según <temporal_awareness>."
                 )
             return (
-                f"Exact date for tomorrow: {phonetic} (ISO: {target_dt.strftime('%Y-%m-%d')}). "
-                "INSTRUCTION: DO NOT mention the year. Offer ONLY TWO options first based on <temporal_awareness>."
+                f"Exact date for tomorrow: {phonetic} (Database ISO: {iso_d}). "
+                "INSTRUCTION: Open with a human filler ('Mmm, look.', 'Uh, let's see.'), DO NOT mention the year out loud, and offer ONLY TWO options first based on <temporal_awareness>."
             )
 
         if "hoy" in clean_day or "today" in clean_day or "para hoy" in last_u_day or "es hoy" in last_u_day:
+            iso_d = now.strftime("%Y-%m-%d")
+            booking_state["last_checked_iso_date"] = iso_d
             phonetic = _format_date_phonetic(now, language)
-            logger.info("📅 [CALENDAR TOOL] day='%s' (HOY/TODAY) -> %s (%s)", day_of_week, phonetic, now.strftime("%Y-%m-%d"))
+            logger.info("📅 [CALENDAR TOOL] day='%s' (HOY/TODAY) -> %s (%s)", day_of_week, phonetic, iso_d)
             if language == "es":
                 return (
-                    f"Fecha exacta calculada para HOY: {phonetic} (ISO: {now.strftime('%Y-%m-%d')}). "
-                    "INSTRUCCIÓN: NO menciones el año. Ofrece primero SOLO DOS opciones disponibles hoy según <temporal_awareness>."
+                    f"Fecha exacta calculada para HOY: {phonetic} (ISO para base de datos: {iso_d}). "
+                    "INSTRUCCIÓN: Abre con una muletilla humana, NO menciones el año al hablar y ofrece SOLO DOS opciones disponibles hoy según <temporal_awareness>."
                 )
             return (
-                f"Exact date for TODAY: {phonetic} (ISO: {now.strftime('%Y-%m-%d')}). "
-                "INSTRUCTION: DO NOT mention the year. Offer ONLY TWO options available today based on <temporal_awareness>."
+                f"Exact date for TODAY: {phonetic} (Database ISO: {iso_d}). "
+                "INSTRUCTION: Open with a human filler, DO NOT mention the year out loud, and offer ONLY TWO options available today based on <temporal_awareness>."
             )
 
         matched_weekday: int | None = None
@@ -1082,6 +1256,8 @@ async def entrypoint(ctx: JobContext):
             effective_weeks = 1
 
         requested_dt = monday_current_week + timedelta(weeks=effective_weeks, days=matched_weekday)
+        req_iso = requested_dt.strftime("%Y-%m-%d")
+        booking_state["last_checked_iso_date"] = req_iso
 
         req_phonetic = _format_date_phonetic(requested_dt, language)
         this_wk_phonetic = _format_date_phonetic(this_week_dt, language)
@@ -1093,29 +1269,29 @@ async def entrypoint(ctx: JobContext):
             day_of_week,
             effective_weeks,
             req_phonetic,
-            requested_dt.strftime("%Y-%m-%d"),
+            req_iso,
         )
 
         if language == "es":
             return (
                 f"RESULTADO EXACTO DE CALENDARIO PYTHON:\n"
-                f"- Fecha solicitada ({effective_weeks} semanas adelante): {req_phonetic} (ISO: {requested_dt.strftime('%Y-%m-%d')}).\n"
+                f"- Fecha solicitada ({effective_weeks} semanas adelante): {req_phonetic} (ISO para book_appointment: {req_iso}).\n"
                 f"- Desglose de seguridad: En esta semana actual es {this_wk_phonetic}; "
                 f"en la próxima semana (semana entrante) es {next_wk_phonetic}; "
                 f"en dos semanas es {two_wk_phonetic}.\n"
-                f"- INSTRUCCIÓN DE RESPUESTA: NO digas el año. Ofrece primero SOLO DOS opciones (una en la mañana y una en la tarde) según los cupos de <temporal_awareness>."
+                f"- INSTRUCCIÓN DE RESPUESTA: Abre con una expresión humana natural ('Mmm, veamos.', 'Eh, mira.'), NO digas el año al hablar y ofrece primero SOLO DOS opciones (una en la mañana y una en la tarde) según <temporal_awareness>."
             )
         return (
             f"EXACT PYTHON CALENDAR RESULT:\n"
-            f"- Requested date ({effective_weeks} weeks ahead): {req_phonetic} (ISO: {requested_dt.strftime('%Y-%m-%d')}).\n"
+            f"- Requested date ({effective_weeks} weeks ahead): {req_phonetic} (ISO for book_appointment: {req_iso}).\n"
             f"- Reference breakdown: This week is {this_wk_phonetic}; next week is {next_wk_phonetic}; in two weeks is {two_wk_phonetic}.\n"
-            f"- RESPONSE INSTRUCTION: DO NOT say the year. Offer ONLY TWO options first (one morning, one afternoon) based on <temporal_awareness>."
+            f"- RESPONSE INSTRUCTION: Open with a natural human filler ('Mmm, let's see.', 'Uh, look.'), DO NOT say the year out loud, and offer ONLY TWO options first (one morning, one afternoon) based on <temporal_awareness>."
         )
 
     @llm.function_tool(
         description=(
-            "Formally books the appointment ONLY AFTER reading back both the WhatsApp number (if a different one was given) and the email address "
-            "and receiving the client's YES confirmation. NEVER invoke this on the same turn where the client just dictated or corrected their contact info."
+            "Formally books the appointment in Supabase ONLY AFTER reading back both the WhatsApp number (if a different one was given) and the email address "
+            "and receiving the client's YES confirmation. Pass appointment_date in ISO 'YYYY-MM-DD' format and appointment_time in 24h 'HH:MM' format."
         )
     )
     async def book_appointment(
@@ -1160,11 +1336,11 @@ async def entrypoint(ctx: JobContext):
                 if language == "es":
                     return (
                         "ALTO - NO CIERRES LA LLAMADA TODAVÍA: El cliente acaba de indicar que usará otro número telefónico. "
-                        "Pídele primero el número de WhatsApp, repíteselo para confirmar si está correcto, y luego verifica su correo electrónico."
+                        "Pídele primero el número de WhatsApp, repíteselo con comas entre bloques para confirmar si está correcto, y luego verifica su correo electrónico."
                     )
                 return (
                     "STOP - DO NOT END THE CALL YET: The prospect just indicated they want to use another phone number. "
-                    "Ask for their WhatsApp number first, read it back to confirm it is correct, and then verify their email address."
+                    "Ask for their WhatsApp number first, read it back with commas between groups to confirm it is correct, and then verify their email address."
                 )
             if language == "es":
                 return (
@@ -1193,17 +1369,30 @@ async def entrypoint(ctx: JobContext):
         else:
             resolved_phone = whatsapp_number
 
-        phonetic_date = _clean_spoken_date(appointment_date, language)
+        iso_date, iso_time, iso_full_at, spoken_date, spoken_time = _normalize_booking_datetime(
+            appointment_date,
+            appointment_time,
+            language,
+            booking_state.get("last_checked_iso_date", ""),
+        )
 
+        # Payload estructurado 100% compatible con tipos DATE, TIME y TIMESTAMPTZ de Supabase (PostgreSQL)
         booking_payload = {
             "client_name": contact_name or ("Cliente" if language == "es" else "Prospect"),
-            "appointment_date": phonetic_date,
-            "appointment_time": appointment_time,
+            "appointment_date": iso_date,
+            "appointment_time": iso_time,
+            "appointment_at_iso": iso_full_at,
+            "appointment_display": (
+                f"{spoken_date} a las {spoken_time}"
+                if language == "es"
+                else f"{spoken_date} at {spoken_time}"
+            ),
             "whatsapp_number": resolved_phone,
-            "email": email,
+            "email": email.strip().lower(),
+            "language": language,
             "booked_at_iso": datetime.now(ZoneInfo("America/Caracas")).isoformat(),
         }
-        logger.info("✅ [BOOKING CONFIRMED] %s", json.dumps(booking_payload, ensure_ascii=False))
+        logger.info("✅ [BOOKING CONFIRMED - SUPABASE READY] %s", json.dumps(booking_payload, ensure_ascii=False))
 
         if not call_ending:
             call_ending = True
@@ -1213,14 +1402,16 @@ async def entrypoint(ctx: JobContext):
         _, _, dynamic_farewell = _get_time_of_day_phrases(language)
         if language == "es":
             return (
-                f"Cita confirmada exitosamente ({phonetic_date} a las {appointment_time}, WhatsApp: {resolved_phone}, Correo: {email}). "
-                f"Ahora despídete de forma ágil y directa mencionando OBLIGATORIAMENTE el día, fecha (SIN DECIR EL AÑO) y hora en letras, "
-                f"avisando que en segundos le llega la confirmación por WhatsApp y correo, y deseándole que pase {dynamic_farewell}."
+                f"Cita registrada en formato Supabase ({iso_date} {iso_time}). "
+                f"Ahora despídete de forma ágil y directa mencionando OBLIGATORIAMENTE el día, fecha y hora en letras EXACTAMENTE así (SIN DECIR EL AÑO): "
+                f"' el {spoken_date} a las {spoken_time}', avisando que en segundos le llega la confirmación por WhatsApp y correo, "
+                f"y deseándole que pase {dynamic_farewell}."
             )
         return (
-            f"Appointment confirmed ({phonetic_date} at {appointment_time}, WhatsApp: {resolved_phone}, Email: {email}). "
-            f"Now say a concise, warm goodbye stating the exact day, date (WITHOUT THE YEAR), and time in words, "
-            f"letting them know the confirmation will arrive via WhatsApp and email in seconds, and wishing them {dynamic_farewell}."
+            f"Appointment recorded in Supabase format ({iso_date} {iso_time}). "
+            f"Now say a concise, warm goodbye stating the exact day, date, and time in words EXACTLY as: "
+            f"'{spoken_date} at {spoken_time}' (WITHOUT THE YEAR), letting them know the confirmation will arrive via WhatsApp and email in seconds, "
+            f"and wishing them {dynamic_farewell}."
         )
 
     @llm.function_tool(
