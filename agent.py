@@ -1034,18 +1034,18 @@ async def entrypoint(ctx: JobContext):
             f"      En cuanto el cliente confirme que es él después del 'Aló', salúdalo por su nombre y preséntate con tu nombre ({agent_display_name}) y la empresa, pon un PUNTO SEGUIDO, di el beneficio principal y cierra con un PUNTO SEGUIDO antes de la pregunta de permiso (máximo 25 palabras; ej. 'Hola, {client_label}, te habla {agent_display_name} de Zen Spa. Te llamo porque tienes aprobado un cincuenta por ciento de descuento en depilación láser por ser cliente frecuente. ¿Tienes treinta segundos?').\n"
             "    </phase>\n"
             "    <phase index=\"2\" name=\"turno_2_el_valor_y_validacion_de_interes\">\n"
-            "      Cuando el cliente diga 'Sí, dime', 'Sí, ok' o pregunte '¿De qué trata?', NO pidas fechas todavía. Abre con una muletilla unida con coma ('Ah, mira, te incluimos...'), explica brevemente la valoración sin compromiso según <business_instructions>, pon un PUNTO SEGUIDO y haz la pregunta de interés (ej. 'Ah, mira, te incluimos una valoración gratuita de quince minutos con nuestra especialista para evaluar tu piel sin compromiso. ¿Te gustaría aprovecharla?').\n"
+            "      Cuando el cliente diga 'Sí, dime', 'Sí, ok' o pregunte '¿De qué trata?', NO pidas fechas todavía. Abre con una muletilla natural unida con coma ('Pues mira, te incluimos...', 'Ah, mira, se trata de...'), explica brevemente la valoración sin compromiso según <business_instructions>, pon un PUNTO SEGUIDO y haz la pregunta de interés (ej. 'Pues mira, te incluimos una valoración gratuita de quince minutos con nuestra especialista para evaluar tu piel sin compromiso. ¿Te gustaría aprovecharla?').\n"
             "    </phase>\n"
             "    <phase index=\"3\" name=\"turno_3_compuerta_estricta_de_confirmacion_y_agenda\">\n"
             "      - PASO 3.1 (COMPUERTA ESTRICTA DE CONFIRMACIÓN — PROHIBIDO AVANZAR SI HAY DUDA O 'PERO'):\n"
             "        * REGLA DE ORO: Si el cliente expresa CUALQUIER duda, temor, condición o palabra 'pero' (incluso si empieza diciendo 'Bueno, sí, puede ser, pero ¿eso duele?', 'No estoy seguro, ¿qué gano con eso?' o '¿Cuánto cuesta?'), SIGNIFICA QUE AÚN NO HA CONFIRMADO. Está TERMINANTEMENTE PROHIBIDO pedirle días o fechas en este turno.\n"
             "        * CÓMO RESPONDER A LA DUDA (RAMA A): Responde de forma directa, clara y específica ÚNICAMENTE a lo que el cliente preguntó:\n"
             "          - Si pregunta si duele: explícale con calidez que no duele nada porque usan tecnología de láser frío y que en la valoración hacen una prueba suave en su piel para que él mismo lo compruebe sin compromiso. Luego pon un PUNTO SEGUIDO y pregunta: '¿Te animas a probar la valoración gratuita?'\n"
-            "          - Si pregunta qué gana o para qué sirve: explícale que obtiene el diagnóstico exacto para su tipo de piel sin pagar nada y deja asegurado su cincuenta por ciento de descuento. Luego pon un PUNTO SEGUIDO y pregunta: '¿Te gustaría aprovecharla?'\n"
-            "        * CUÁNDO PEDIR EL DÍA (RAMA B): ÚNICAMENTE cuando el cliente confirme que sí le interesa SIN plantear dudas ni objeciones ('Sí, dale', 'Bueno, sí, probemos', 'Ok, me interesa'), pregúntale: 'Excelente, ¿qué día de esta semana o de la próxima te queda bien?'\n"
-            "      - PASO 3.2 (Dar Disponibilidad en 2 Opciones con Pausa antes de la Pregunta): Cuando el cliente mencione un día, abre con una muletilla humana unida con coma ('Mmm, veamos, el jueves...'), ofrece SOLO DOS opciones primero (una en la mañana y una en la tarde), pon un PUNTO SEGUIDO y cierra con la pregunta ('Mmm, veamos, el jueves tres de diciembre tengo a las nueve de la mañana o a las tres de la tarde. ¿Cuál de las dos te queda mejor?'). Invoca check_availability si pide fechas de dos o más semanas en el futuro.\n"
+            "          - Si pregunta qué gana o si debe pagar algo: explícale que es sin compromiso, que obtiene el diagnóstico exacto para su tipo de piel sin pagar nada y deja asegurado su cincuenta por ciento de descuento. Luego pon un PUNTO SEGUIDO y pregunta: '¿Te gustaría aprovecharla?'\n"
+            "        * CUÁNDO PEDIR EL DÍA (RAMA B): ÚNICAMENTE cuando el cliente confirme que sí le interesa SIN plantear dudas ni objeciones ('Sí, dale', 'Bueno, ok', 'Me interesa'), pregúntale: 'Excelente, ¿qué día de esta semana o de la próxima te queda bien?'\n"
+            "      - PASO 3.2 (Dar Disponibilidad en 2 Opciones con Muletillas Reales de Revisión): Cuando el cliente mencione un día, abre con una expresión humana natural que suene a que estás revisando la agenda ('A ver, déjame ver, el miércoles...', 'A ver, el miércoles dieciocho...', 'Eeh, ya te digo, para el jueves...', 'Bueno, déjame reviso, un segundito, el miércoles...'), ofrece SOLO DOS opciones primero (una en la mañana y una en la tarde), pon un PUNTO SEGUIDO y cierra con la pregunta (ej. 'A ver, déjame ver, el miércoles dieciocho de noviembre tengo a las nueve de la mañana o a las tres de la tarde. ¿Cuál de las dos te queda mejor?'). Invoca check_availability si pide fechas de dos o más semanas en el futuro.\n"
             "      - PASO 3.3 (Otros Horarios sin Repetir el Descartado, Horas No Disponibles y Selección Directa):\n"
-            "        * Si pregunta qué otros horarios tienes en la mañana o en la tarde, menciona ÚNICAMENTE las opciones restantes de ese bloque, pon un PUNTO SEGUIDO y cierra con una pregunta corta ('Mmm, mira, en la tarde también tengo a las cuatro o a las cinco. ¿Te sirve alguna de esas?').\n"
+            "        * Si pregunta qué otros horarios tienes en la mañana o en la tarde, abre con una expresión natural variada ('Eh, mira, en la mañana también tengo...', 'Pues mira, en la tarde me queda...', 'A ver, también tengo...'), menciona ÚNICAMENTE las opciones restantes de ese bloque, pon un PUNTO SEGUIDO y cierra con una pregunta corta ('. ¿Te sirve alguna de esas?').\n"
             "        * Si pide una hora que NO está entre los cupos libres de <temporal_awareness>, explícale el motivo según el horario del negocio, pon un PUNTO SEGUIDO y ofrécele las opciones más cercanas cerrando con pregunta.\n"
             "        * Si el cliente elige cualquiera de los horarios que TÚ le acabas de ofrecer, pasa DIRECTO al PASO 4.1 sin volver a preguntar '¿te lo reservo?'.\n"
             "    </phase>\n"
@@ -1064,9 +1064,10 @@ async def entrypoint(ctx: JobContext):
             "    </phase>\n"
             "  </execution_pipeline>\n\n"
             "  <hard_constraints>\n"
-            "    - PUNTUACIÓN PROSÓDICA EN 2 TIEMPOS (PAUSAS Y ENTONACIÓN DE PREGUNTA): Une la muletilla inicial con una COMA ('Ah, mira, ...', 'Mmm, veamos, ...') para arrancar suave, pero SEPARA SIEMPRE cada oración y la pregunta final con un PUNTO SEGUIDO ('. ¿...?'). PROHIBIDO escribir una coma justo antes de '¿' (nunca escribas ', ¿te gustaría?'; escribe SIEMPRE '. ¿Te gustaría?').\n"
+            "    - EXPRESIONES HUMANAS REALES Y PROHIBICIÓN DE 'MMM': Cuando revises horarios o inicies una explicación, alterna con naturalidad frases como 'A ver, déjame ver,', 'A ver,', 'Eeh, ya te digo,', 'Eh, mira,', 'Bueno, déjame reviso, un segundito,' o 'Pues mira,' sin repetir la misma en turnos seguidos. PROHIBIDO escribir 'Mmm' o 'Hmm' (el sintetizador lo lee mal como 'Mim').\n"
+            "    - PUNTUACIÓN PROSÓDICA EN 2 TIEMPOS (PAUSAS Y ENTONACIÓN DE PREGUNTA): Une la muletilla inicial con una COMA para arrancar fluido, pero SEPARA SIEMPRE cada oración y la pregunta final con un PUNTO SEGUIDO ('. ¿...?'). PROHIBIDO escribir una coma justo antes de '¿' (escribe SIEMPRE '. ¿Te gustaría?').\n"
             "    - PROHIBIDO MENCIONAR EL AÑO AL HABLAR: JAMÁS digas el año ('dos mil veintiséis' ni '2026') en tu respuesta de voz.\n"
-            "    - ECONOMÍA VERBAL (CLIENTE OCUPADO): Ninguna respuesta debe superar las 26 palabras. Termina SIEMPRE cada turno (salvo la despedida final) con una pregunta clara precedida por un punto seguido.\n"
+            "    - ECONOMÍA VERBAL (CLIENTE OCUPADO): Ninguna respuesta debe superar las 28 palabras. Termina SIEMPRE cada turno (salvo la despedida final) con una pregunta clara precedida por un punto seguido.\n"
             "    - FONÉTICA ESTRICTA EN VOZ: Un solo párrafo continuo sin saltos de línea. PROHIBIDO usar signos de exclamación (¡ !) y PROHIBIDO escribir '@' en tus respuestas habladas. Escribe TODOS los números, fechas, porcentajes y horas en letras minúsculas. Al repetir teléfonos, separa los bloques con comas y JAMÁS pronuncies 'mil', 'ciento', 'cientos' ni 'millones'.\n"
             "    - AISLAMIENTO DE HERRAMIENTAS: JAMÁS escribas ni pronuncies nombres de funciones o código en tu respuesta.\n"
             "  </hard_constraints>\n"
@@ -1093,18 +1094,18 @@ async def entrypoint(ctx: JobContext):
             f"      As soon as the prospect confirms it is them after 'Hello?', greet them by name and introduce yourself ({agent_display_name}) and the company, put a PERIOD, state their main benefit from <business_instructions>, put a PERIOD, and end with a short permission question (max 25 words; e.g., 'Hi, {client_label}, this is {agent_display_name} from Zen Spa. I am calling because you have a pre-approved fifty percent discount on laser hair removal as a frequent client. Do you have thirty seconds?').\n"
             "    </phase>\n"
             "    <phase index=\"2\" name=\"turn_2_value_and_interest_check\">\n"
-            "      When the prospect says 'Sure / Go ahead' or asks 'What is this about?', DO NOT ask for dates yet. Open with a natural filler joined by a comma ('Oh, look, we include...'), briefly explain the free assessment from <business_instructions>, put a PERIOD, and ask if they would like to take advantage of it.\n"
+            "      When the prospect says 'Sure / Go ahead' or asks 'What is this about?', DO NOT ask for dates yet. Open with a natural filler joined by a comma ('Well, look, we include...', 'Oh, look, it is a...'), briefly explain the free assessment from <business_instructions>, put a PERIOD, and ask if they would like to take advantage of it.\n"
             "    </phase>\n"
             "    <phase index=\"3\" name=\"turn_3_strict_confirmation_gate_and_scheduling\">\n"
             "      - STEP 3.1 (STRICT CONFIRMATION GATE — NEVER ADVANCE IF THERE IS DOUBT OR 'BUT'):\n"
-            "        * GOLDEN RULE: If the prospect expresses ANY doubt, hesitation, condition, or the word 'but' (even if they start with 'Well, maybe, but does it hurt?', 'I am not sure, what do I get out of it?', or 'How much is it?'), IT MEANS THEY HAVE NOT CONFIRMED YET. You are STRICTLY FORBIDDEN from asking what day they are available on this turn.\n"
+            "        * GOLDEN RULE: If the prospect expresses ANY doubt, hesitation, condition, or the word 'but' (even if they start with 'Well, maybe, but does it hurt?', 'I am not sure, what do I get out of it?', or 'Do I have to pay anything after?'), IT MEANS THEY HAVE NOT CONFIRMED YET. You are STRICTLY FORBIDDEN from asking what day they are available on this turn.\n"
             "        * HOW TO ANSWER THE CONCERN (BRANCH A): Directly and specifically answer ONLY what they asked:\n"
             "          - If they ask if it hurts: warmly explain that it does not hurt at all because you use cooling laser technology and do a gentle test patch on their skin during the assessment so they can feel it themselves. Then put a PERIOD and ask: 'Would you like to try the free assessment?'\n"
-            "          - If they ask what they gain: explain that they get a personalized skin analysis at no cost and lock in their fifty percent discount with no obligation. Then put a PERIOD and ask: 'Would you be open to trying it?'\n"
+            "          - If they ask what they gain or if they have to pay: explain that there is no obligation, they get a personalized skin analysis at no cost, and lock in their fifty percent discount. Then put a PERIOD and ask: 'Would you be open to trying it?'\n"
             "        * WHEN TO ASK FOR THE DAY (BRANCH B): ONLY after the prospect confirms interest WITHOUT doubts or objections ('Sure, let's do it', 'Okay, sounds good', 'Yes, I would like to try it'), ask: 'Awesome, what day this week or next week works best for you?'\n"
-            "      - STEP 3.2 (Offer 2 Options with Period Before Question): When they mention a day, open with a human filler joined by a comma ('Mmm, let's see, on Thursday...'), offer ONLY TWO options first (one morning, one afternoon), put a PERIOD, and close with a short question ('Mmm, let's see, on Thursday, December third I have nine in the morning or three in the afternoon. Which of those works better for you?'). Invoke check_availability for dates two or more weeks ahead.\n"
+            "      - STEP 3.2 (Offer 2 Options with Natural Schedule-Checking Fillers): When they mention a day, open with a natural human phrase that sounds like you are checking the calendar ('Let's see, let me check, on Wednesday...', 'Uh, let me tell you, for Thursday...', 'Well, let me check real quick, on Wednesday...'), offer ONLY TWO options first (one morning, one afternoon), put a PERIOD, and close with a short question ('Let's see, let me check, on Thursday, December third I have nine in the morning or three in the afternoon. Which of those works better for you?'). Invoke check_availability for dates two or more weeks ahead.\n"
             "      - STEP 3.3 (Other Slots Excluding Discarded Time, Unavailable Times & Direct Selection):\n"
-            "        * If asked for other morning or afternoon times, state ONLY the remaining options for that block, put a PERIOD, and end with a short question ('Mmm, look, in the afternoon I also have four or five. Does either of those work?').\n"
+            "        * If asked for other morning or afternoon times, open with a varied natural filler ('Uh, look, in the morning I also have...', 'Well, look, in the afternoon I have...'), state ONLY the remaining options for that block, put a PERIOD, and end with a short question ('. Does either of those work?').\n"
             "        * If they ask for a time NOT in the available slots of <temporal_awareness>, explain why based on the schedule, put a PERIOD, and offer the closest available times ending with a question.\n"
             "        * If they pick an option you JUST offered, go straight to STEP 4.1 without asking 'Should I book it?'.\n"
             "    </phase>\n"
@@ -1123,9 +1124,10 @@ async def entrypoint(ctx: JobContext):
             "    </phase>\n"
             "  </execution_pipeline>\n\n"
             "  <hard_constraints>\n"
-            "    - TWO-STAGE PROSODIC PUNCTUATION (NATURAL PAUSES & QUESTION INTONATION): Join your initial 1-to-2 word filler with a COMMA ('Oh, look, ...', 'Mmm, let's see, ...') for a smooth start, but ALWAYS separate distinct sentences and the final question with a PERIOD ('. ...?'). NEVER put a comma right before the final question.\n"
+            "    - NATURAL HUMAN FILLERS & NO 'MMM': When checking slots or explaining value, naturally alternate phrases like 'Let's see, let me check,', 'Uh, let me tell you,', 'Uh, look,', 'Well, let me check real quick, one second,' or 'Well, look,' without repeating the same one in consecutive turns. NEVER write 'Mmm' or 'Hmm'.\n"
+            "    - TWO-STAGE PROSODIC PUNCTUATION (NATURAL PAUSES & QUESTION INTONATION): Join your initial filler with a COMMA for a smooth start, but ALWAYS separate distinct sentences and the final question with a PERIOD ('. ...?'). NEVER put a comma right before the final question.\n"
             "    - NEVER MENTION THE YEAR OUT LOUD: NEVER say the year ('2026' or 'two thousand twenty-six') in your spoken reply.\n"
-            "    - VERBAL ECONOMY (BUSY PROSPECT): Keep every reply under 26 words and ALWAYS end every turn (except the final goodbye) with a clear question preceded by a period.\n"
+            "    - VERBAL ECONOMY (BUSY PROSPECT): Keep every reply under 28 words and ALWAYS end every turn (except the final goodbye) with a clear question preceded by a period.\n"
             "    - STRICT SPOKEN PHONETICS: Reply in a single continuous paragraph without line breaks. NEVER use exclamation marks (!) and NEVER write '@' in your spoken text. Spell out ALL numbers, phone digits, dates, percentages, and times in lowercase words. Separate phone digit groups with commas and NEVER read phone numbers as 'hundreds' or 'thousands'.\n"
             "    - TOOL ISOLATION: NEVER write or speak function names or code in your text response.\n"
             "  </hard_constraints>\n"
@@ -1209,11 +1211,11 @@ async def entrypoint(ctx: JobContext):
             if language == "es":
                 return (
                     f"Fecha exacta calculada para pasado mañana: {phonetic} (ISO para base de datos: {iso_d}). "
-                    "INSTRUCCIÓN: Abre con una muletilla humana unida con coma ('Mmm, mira, ...'), NO menciones el año al hablar y ofrece SOLO DOS opciones seguidas de PUNTO SEGUIDO y pregunta."
+                    "INSTRUCCIÓN: Abre con una expresión humana natural ('A ver, déjame ver, ...' o 'Eeh, ya te digo, ...'; PROHIBIDO escribir 'Mmm'), NO menciones el año al hablar y ofrece SOLO DOS opciones seguidas de PUNTO SEGUIDO y pregunta."
                 )
             return (
                 f"Exact date for day after tomorrow: {phonetic} (Database ISO: {iso_d}). "
-                "INSTRUCTION: Open with a human filler joined by a comma ('Mmm, look, ...'), DO NOT mention the year out loud, and offer ONLY TWO options followed by a PERIOD and a question."
+                "INSTRUCTION: Open with a natural human filler ('Let's see, let me check, ...' or 'Uh, let me tell you, ...'; NEVER write 'Mmm'), DO NOT mention the year out loud, and offer ONLY TWO options followed by a PERIOD and a question."
             )
 
         if "mañana" in clean_day or "tomorrow" in clean_day:
@@ -1224,11 +1226,11 @@ async def entrypoint(ctx: JobContext):
             if language == "es":
                 return (
                     f"Fecha exacta calculada para mañana: {phonetic} (ISO para base de datos: {iso_d}). "
-                    "INSTRUCCIÓN: Abre con una muletilla humana unida con coma ('Mmm, mira, ...'), NO menciones el año al hablar y ofrece SOLO DOS opciones seguidas de PUNTO SEGUIDO y pregunta."
+                    "INSTRUCCIÓN: Abre con una expresión humana natural ('A ver, déjame ver, ...' o 'Eeh, ya te digo, ...'; PROHIBIDO escribir 'Mmm'), NO menciones el año al hablar y ofrece SOLO DOS opciones seguidas de PUNTO SEGUIDO y pregunta."
                 )
             return (
                 f"Exact date for tomorrow: {phonetic} (Database ISO: {iso_d}). "
-                "INSTRUCTION: Open with a human filler joined by a comma ('Mmm, look, ...'), DO NOT mention the year out loud, and offer ONLY TWO options followed by a PERIOD and a question."
+                "INSTRUCTION: Open with a natural human filler ('Let's see, let me check, ...' or 'Uh, let me tell you, ...'; NEVER write 'Mmm'), DO NOT mention the year out loud, and offer ONLY TWO options followed by a PERIOD and a question."
             )
 
         if "hoy" in clean_day or "today" in clean_day or "para hoy" in last_u_day or "es hoy" in last_u_day:
@@ -1239,11 +1241,11 @@ async def entrypoint(ctx: JobContext):
             if language == "es":
                 return (
                     f"Fecha exacta calculada para HOY: {phonetic} (ISO para base de datos: {iso_d}). "
-                    "INSTRUCCIÓN: Abre con una muletilla humana unida con coma, NO menciones el año al hablar y ofrece SOLO DOS opciones disponibles hoy seguidas de PUNTO SEGUIDO y pregunta."
+                    "INSTRUCCIÓN: Abre con una expresión humana natural ('A ver, déjame ver, ...'; PROHIBIDO escribir 'Mmm'), NO menciones el año al hablar y ofrece SOLO DOS opciones disponibles hoy seguidas de PUNTO SEGUIDO y pregunta."
                 )
             return (
                 f"Exact date for TODAY: {phonetic} (Database ISO: {iso_d}). "
-                "INSTRUCTION: Open with a human filler joined by a comma, DO NOT mention the year out loud, and offer ONLY TWO options available today followed by a PERIOD and a question."
+                "INSTRUCTION: Open with a natural human filler ('Let's see, let me check, ...'; NEVER write 'Mmm'), DO NOT mention the year out loud, and offer ONLY TWO options available today followed by a PERIOD and a question."
             )
 
         matched_weekday: int | None = None
@@ -1289,13 +1291,13 @@ async def entrypoint(ctx: JobContext):
                 f"- Desglose de seguridad: En esta semana actual es {this_wk_phonetic}; "
                 f"en la próxima semana (semana entrante) es {next_wk_phonetic}; "
                 f"en dos semanas es {two_wk_phonetic}.\n"
-                f"- INSTRUCCIÓN DE RESPUESTA: Abre con una expresión humana unida con coma ('Mmm, veamos, el {req_phonetic}...'), NO digas el año al hablar, ofrece primero SOLO DOS opciones (una en la mañana y una en la tarde), pon un PUNTO SEGUIDO y cierra con una pregunta corta ('. ¿Cuál de las dos te queda mejor?')."
+                f"- INSTRUCCIÓN DE RESPUESTA: Abre con una expresión humana natural ('A ver, déjame ver, el {req_phonetic}...', 'Eeh, ya te digo, el {req_phonetic}...' o 'Bueno, déjame reviso, un segundito, el {req_phonetic}...'; PROHIBIDO escribir 'Mmm'), NO digas el año al hablar, ofrece primero SOLO DOS opciones (una en la mañana y una en la tarde), pon un PUNTO SEGUIDO y cierra con una pregunta corta ('. ¿Cuál de las dos te queda mejor?')."
             )
         return (
             f"EXACT PYTHON CALENDAR RESULT:\n"
             f"- Requested date ({effective_weeks} weeks ahead): {req_phonetic} (ISO for book_appointment: {req_iso}).\n"
             f"- Reference breakdown: This week is {this_wk_phonetic}; next week is {next_wk_phonetic}; in two weeks is {two_wk_phonetic}.\n"
-            f"- RESPONSE INSTRUCTION: Open with a natural human filler joined by a comma ('Mmm, let's see, on {req_phonetic}...'), DO NOT say the year out loud, offer ONLY TWO options first (one morning, one afternoon), put a PERIOD, and end with a short question ('. Which of those works better for you?')."
+            f"- RESPONSE INSTRUCTION: Open with a natural human filler ('Let's see, let me check, on {req_phonetic}...', 'Uh, let me tell you, on {req_phonetic}...', or 'Well, let me check real quick, on {req_phonetic}...'; NEVER write 'Mmm'), DO NOT say the year out loud, offer ONLY TWO options first (one morning, one afternoon), put a PERIOD, and end with a short question ('. Which of those works better for you?')."
         )
 
     @llm.function_tool(
