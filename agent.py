@@ -51,7 +51,7 @@ AGENT_NAME = "outbound-agent"
 SIP_TRUNK_ID = os.environ.get("LIVEKIT_SIP_TRUNK_ID", "")
 DEFAULT_TTS_MODEL = "cartesia/sonic-2"
 DEFAULT_ES_TEST_VOICE = "deepgram/aura-2:celeste-es"
-DEFAULT_EN_TEST_VOICE = "cartesia/sonic-3:f786b574-daa5-4673-aa0c-cbe3e8534c02"
+DEFAULT_EN_TEST_VOICE = "deepgram/aura-2:thalia-en"
 DEFAULT_LIVEKIT_LLM_MODEL = os.environ.get("LIVEKIT_LLM_MODEL", "openai/gpt-4o-mini")
 DEFAULT_OPENROUTER_LLM_MODEL = os.environ.get("OPENROUTER_LLM_MODEL", "google/gemini-2.5-flash")
 SECONDARY_OPENROUTER_LLM_MODEL = os.environ.get("SECONDARY_OPENROUTER_LLM_MODEL", "anthropic/claude-haiku-5.5")
@@ -249,10 +249,11 @@ HOURS_EN_WORDS = {
 
 
 def _format_to_e164_ve(raw_input: str) -> str:
-    """Convierte cualquier teléfono venezolano (con o sin 0 inicial) al estándar internacional E.164 (+58...)."""
+    """Convierte teléfonos de Venezuela (+58) o EE. UU./Canadá (+1) al estándar internacional E.164."""
     digits = re.sub(r"\D", "", raw_input)
     if not digits:
         return ""
+    # 1. Números venezolanos (con o sin 0 inicial)
     if len(digits) == 11 and digits.startswith("0") and digits[1:].startswith(VE_AREA_PREFIXES):
         return f"+58{digits[1:]}"
     if len(digits) == 10 and digits.startswith(VE_AREA_PREFIXES):
@@ -261,6 +262,11 @@ def _format_to_e164_ve(raw_input: str) -> str:
         return f"+{digits}"
     if len(digits) == 13 and digits.startswith("580") and digits[3:].startswith(VE_AREA_PREFIXES):
         return f"+58{digits[3:]}"
+    # 2. Números de EE. UU. / Canadá (NANP: 10 dígitos [2-9]XX-XXX-XXXX o 11 dígitos iniciando en 1)
+    if len(digits) == 10 and digits[0] in "23456789":
+        return f"+1{digits}"
+    if len(digits) == 11 and digits.startswith("1") and digits[1] in "23456789":
+        return f"+{digits}"
     if 10 <= len(digits) <= 15:
         return f"+{digits}"
     return ""
@@ -286,7 +292,7 @@ def _parse_sub_100(tokens: list[str], idx: int) -> tuple[int | None, int]:
 
 
 def _extract_phone_digits_from_text(text: str) -> str:
-    """Extrae de forma 100% determinista el teléfono en formato E.164 (+58...) en español o inglés (incluyendo 'double'/'triple')."""
+    """Extrae de forma 100% determinista el teléfono en formato E.164 (+58 o +1) en español o inglés (incluyendo 'double'/'triple')."""
     lower = text.lower()
     if (
         "arroba" in lower
@@ -772,7 +778,7 @@ def _build_stt(language: str, contact_name: str = "") -> lk_stt.STT:
 
 
 def _build_tts(voice_id: str | None, language: str) -> lk_tts.TTS:
-    """Construye el motor TTS priorizando BYOK directo (Deepgram Aura-2 para Celeste = 0 créditos Cartesia, o Cartesia sonic-3/sonic-latest)."""
+    """Construye el motor TTS priorizando BYOK directo (Deepgram Aura-2 para Celeste ES y Thalia EN = 0 créditos Cartesia, o Cartesia BYOK)."""
     deepgram_api_key = os.environ.get("DEEPGRAM_API_KEY", "").strip()
     cartesia_api_key = os.environ.get("CARTESIA_API_KEY", "").strip()
 
@@ -783,10 +789,11 @@ def _build_tts(voice_id: str | None, language: str) -> lk_tts.TTS:
         voice = voice_id[idx + 1:]
         model = voice_id[:idx]
 
-    # 1. Si la voz seleccionada es de Deepgram (ej. Celeste 'deepgram/aura-2:celeste-es'), usar Deepgram Direct Plugin (0 créditos de Cartesia)
+    # 1. Si la voz seleccionada es de Deepgram (ej. Celeste 'deepgram/aura-2:celeste-es' o Thalia 'deepgram/aura-2:thalia-en'), usar Deepgram Direct Plugin (0 créditos de Cartesia)
     if model.startswith("deepgram/") and deepgram_api_key:
         lang_suffix = "es" if language == "es" else "en"
-        clean_voice = re.sub(r"-(es|en)$", "", (voice or "celeste")).strip()
+        default_v = "celeste" if language == "es" else "thalia"
+        clean_voice = re.sub(r"-(es|en)$", "", (voice or default_v)).strip()
         dg_tts_model = f"aura-2-{clean_voice}-{lang_suffix}"
         logger.info(
             "🎙️ Deepgram Direct TTS (BYOK - 0 Cartesia credits) active: model='%s' | language='%s'",
@@ -795,7 +802,7 @@ def _build_tts(voice_id: str | None, language: str) -> lk_tts.TTS:
         )
         return deepgram.TTS(model=dg_tts_model, api_key=deepgram_api_key)
 
-    # 2. Si la voz seleccionada es de Cartesia (ej. 'cartesia/sonic-3:...' en inglés o voz clonada)
+    # 2. Si la voz seleccionada es de Cartesia (ej. voz clonada o 'cartesia/sonic-latest:...')
     if model.startswith("cartesia/") and cartesia_api_key:
         raw_cartesia_model = model.split("/", 1)[1] if "/" in model else model
         cartesia_model = (
@@ -813,7 +820,6 @@ def _build_tts(voice_id: str | None, language: str) -> lk_tts.TTS:
 
         primary_tts = cartesia.TTS(**cartesia_kwargs)
 
-        # Si se pidió 'sonic-3', agregar respaldo automático a 'sonic-latest' y Deepgram TTS por si el endpoint o los créditos fallan
         fallback_list: list[lk_tts.TTS] = [primary_tts]
         if cartesia_model == "sonic-3":
             fallback_kwargs = dict(cartesia_kwargs, model="sonic-latest")
@@ -983,7 +989,7 @@ async def entrypoint(ctx: JobContext):
     voice_lower = (voice_id or "").lower()
     if "celeste" in voice_lower:
         default_agent_name = "Celeste"
-    elif "f786b574-daa5-4673-aa0c-cbe3e8534c02" in voice_lower or "thalia" in voice_lower:
+    elif "f786b574-daa5-4673-aa0c-cbe3e8534c02" in voice_lower or "thalia" in voice_lower or "asteria" in voice_lower:
         default_agent_name = "Sophia" if language == "en" else "Daniela"
     elif any(k in voice_lower for k in ("5c5ad5e7-1020-476b-8b91-fdcbe9cc313c", "serena", "antonia", "aquila", "estrella", "diana", "carina", "selena")):
         default_agent_name = "Daniela"
@@ -1027,35 +1033,33 @@ async def entrypoint(ctx: JobContext):
             "<agent_system_manifest>\n"
             "  <identity>\n"
             f"    Eres {agent_display_name}, especialista de atención al cliente en llamadas salientes. "
-            "Asumes siempre que el cliente está ocupado haciendo otras cosas: tu ritmo es ágil, cercano, empático y ejecutivo. Hablas siempre en español neutro usando 'tú' (PROHIBIDO usar voseo argentino como 'usás', 'tenés' o 'podés'; di siempre 'usas', 'tienes', 'puedes') y JAMÁS uses términos en inglés como 'Senior Client Success Manager'.\n"
+            "Asumes siempre que el cliente está ocupado haciendo otras cosas: tu ritmo es ágil, cercano, empático y ejecutivo. Hablas siempre en español neutro usando 'tú' (PROHIBIDO usar voseo argentino como 'usás', 'tenés' o 'podés'; di siempre 'usas', 'tienes', 'puedes') y JAMÁS uses términos en inglés como 'Senior Client Success Manager'. No recites plantillas de memoria; responde con naturalidad genuina.\n"
             "  </identity>\n\n"
             "  <execution_pipeline>\n"
             "    <phase index=\"1\" name=\"turno_1_presentacion_con_nombre_y_gancho_corto\">\n"
-            f"      En cuanto el cliente confirme que es él después del 'Aló', salúdalo por su nombre y preséntate con tu nombre ({agent_display_name}) y la empresa, pon un PUNTO SEGUIDO, di el beneficio principal y cierra con un PUNTO SEGUIDO antes de la pregunta de permiso (máximo 25 palabras; ej. 'Hola, {client_label}, te habla {agent_display_name} de Zen Spa. Te llamo porque tienes aprobado un cincuenta por ciento de descuento en depilación láser por ser cliente frecuente. ¿Tienes treinta segundos?').\n"
+            f"      En cuanto el cliente confirme que es él después del 'Aló', salúdalo por su nombre y preséntate con tu nombre ({agent_display_name}) y la empresa, pon un PUNTO SEGUIDO, di el beneficio principal según <business_instructions> y cierra con un PUNTO SEGUIDO antes de la pregunta de permiso (máximo 25 palabras; ej. 'Hola, {client_label}, te habla {agent_display_name} de Zen Spa. Te llamo porque tienes aprobado un cincuenta por ciento de descuento en depilación láser por ser cliente frecuente. ¿Tienes treinta segundos?').\n"
             "    </phase>\n"
             "    <phase index=\"2\" name=\"turno_2_el_valor_y_validacion_de_interes\">\n"
-            "      Cuando el cliente diga 'Sí, dime', 'Sí, ok' o pregunte '¿De qué trata?', NO pidas fechas todavía. Abre con una muletilla natural unida con coma ('Pues mira, te incluimos...', 'Ah, mira, se trata de...'), explica brevemente la valoración sin compromiso según <business_instructions>, pon un PUNTO SEGUIDO y haz la pregunta de interés (ej. 'Pues mira, te incluimos una valoración gratuita de quince minutos con nuestra especialista para evaluar tu piel sin compromiso. ¿Te gustaría aprovecharla?').\n"
+            "      Cuando el cliente diga 'Sí, dime', 'Sí, ok' o pregunte '¿De qué trata?', NO pidas fechas todavía. Abre con una muletilla natural unida con coma ('Pues mira, te incluimos...', 'Ah, mira, se trata de...'), explica brevemente la valoración sin compromiso según <business_instructions>, pon un PUNTO SEGUIDO y haz una pregunta corta para validar si le interesa aprovecharla.\n"
             "    </phase>\n"
-            "    <phase index=\"3\" name=\"turno_3_compuerta_estricta_de_confirmacion_y_agenda\">\n"
-            "      - PASO 3.1 (COMPUERTA ESTRICTA DE CONFIRMACIÓN — PROHIBIDO AVANZAR SI HAY DUDA O 'PERO'):\n"
-            "        * REGLA DE ORO: Si el cliente expresa CUALQUIER duda, temor, condición o palabra 'pero' (incluso si empieza diciendo 'Bueno, sí, puede ser, pero ¿eso duele?', 'No estoy seguro, ¿qué gano con eso?' o '¿Cuánto cuesta?'), SIGNIFICA QUE AÚN NO HA CONFIRMADO. Está TERMINANTEMENTE PROHIBIDO pedirle días o fechas en este turno.\n"
-            "        * CÓMO RESPONDER A LA DUDA (RAMA A): Responde de forma directa, clara y específica ÚNICAMENTE a lo que el cliente preguntó:\n"
-            "          - Si pregunta si duele: explícale con calidez que no duele nada porque usan tecnología de láser frío y que en la valoración hacen una prueba suave en su piel para que él mismo lo compruebe sin compromiso. Luego pon un PUNTO SEGUIDO y pregunta: '¿Te animas a probar la valoración gratuita?'\n"
-            "          - Si pregunta qué gana o si debe pagar algo: explícale que es sin compromiso, que obtiene el diagnóstico exacto para su tipo de piel sin pagar nada y deja asegurado su cincuenta por ciento de descuento. Luego pon un PUNTO SEGUIDO y pregunta: '¿Te gustaría aprovecharla?'\n"
-            "        * CUÁNDO PEDIR EL DÍA (RAMA B): ÚNICAMENTE cuando el cliente confirme que sí le interesa SIN plantear dudas ni objeciones ('Sí, dale', 'Bueno, ok', 'Me interesa'), pregúntale: 'Excelente, ¿qué día de esta semana o de la próxima te queda bien?'\n"
-            "      - PASO 3.2 (Dar Disponibilidad en 2 Opciones con Muletillas Reales de Revisión): Cuando el cliente mencione un día, abre con una expresión humana natural que suene a que estás revisando la agenda ('A ver, déjame ver, el miércoles...', 'A ver, el miércoles dieciocho...', 'Eeh, ya te digo, para el jueves...', 'Bueno, déjame reviso, un segundito, el miércoles...'), ofrece SOLO DOS opciones primero (una en la mañana y una en la tarde), pon un PUNTO SEGUIDO y cierra con la pregunta (ej. 'A ver, déjame ver, el miércoles dieciocho de noviembre tengo a las nueve de la mañana o a las tres de la tarde. ¿Cuál de las dos te queda mejor?'). Invoca check_availability si pide fechas de dos o más semanas en el futuro.\n"
-            "      - PASO 3.3 (Otros Horarios sin Repetir el Descartado, Horas No Disponibles y Selección Directa):\n"
-            "        * Si pregunta qué otros horarios tienes en la mañana o en la tarde, abre con una expresión natural variada ('Eh, mira, en la mañana también tengo...', 'Pues mira, en la tarde me queda...', 'A ver, también tengo...'), menciona ÚNICAMENTE las opciones restantes de ese bloque, pon un PUNTO SEGUIDO y cierra con una pregunta corta ('. ¿Te sirve alguna de esas?').\n"
-            "        * Si pide una hora que NO está entre los cupos libres de <temporal_awareness>, explícale el motivo según el horario del negocio, pon un PUNTO SEGUIDO y ofrécele las opciones más cercanas cerrando con pregunta.\n"
-            "        * Si el cliente elige cualquiera de los horarios que TÚ le acabas de ofrecer, pasa DIRECTO al PASO 4.1 sin volver a preguntar '¿te lo reservo?'.\n"
+            "    <phase index=\"3\" name=\"turno_3_compuerta_estricta_de_confirmacion_y_agenda_dinamica\">\n"
+            "      - PASO 3.1 (COMPUERTA ESTRICTA DE CONFIRMACIÓN — CERO TEXTOS PRE-ARMADOS Y PROHIBIDO REPETIR ARGUMENTOS):\n"
+            "        * REGLA DE ORO: Si el cliente expresa CUALQUIER duda, temor, condición o palabra 'pero' (incluso si empieza diciendo 'Bueno, sí, puede ser, pero...'), SIGNIFICA QUE AÚN NO HA CONFIRMADO. Está TERMINANTEMENTE PROHIBIDO pedirle días o fechas en este turno.\n"
+            "        * CÓMO RESPONDER CON NATURALIDAD (RAMA A): Razona y responde con tus propias palabras ÚNICAMENTE a la duda puntual que planteó el cliente (si pregunta qué gana, enfócate en el valor del diagnóstico personalizado para su piel y asegurar su descuento; si pregunta si debe pagar algo, aclara que asiste gratis y sin obligación de compra; si pregunta si duele, explica la comodidad del láser frío y la prueba suave en su piel). PROHIBIDO repetir las mismas palabras o el mismo argumento si el cliente hace otra pregunta en el turno siguiente. Cierra siempre con un PUNTO SEGUIDO y una pregunta corta para confirmar si se anima a probarlo.\n"
+            "        * CUÁNDO PEDIR EL DÍA (RAMA B): ÚNICAMENTE cuando el cliente confirme que sí le interesa SIN plantear dudas ni objeciones ('Sí, dale', 'Bueno, ok', 'Me interesa'), pregúntale qué día de esta semana o de la próxima le queda bien.\n"
+            "      - PASO 3.2 (Dar Disponibilidad en 2 Opciones con Muletillas Reales de Revisión): Cuando el cliente mencione un día, abre con una expresión humana natural que suene a que estás revisando la agenda ('A ver, déjame ver, el miércoles...', 'A ver, el miércoles dieciocho...', 'Eeh, ya te digo, para el jueves...', 'Bueno, déjame reviso, un segundito, el miércoles...'), ofrece SOLO DOS opciones iniciales de las que aparecen libres en <temporal_awareness>, pon un PUNTO SEGUIDO y cierra con una pregunta corta ('. ¿Cuál de las dos te queda mejor?'). Invoca check_availability si pide fechas de dos o más semanas en el futuro.\n"
+            "      - PASO 3.3 (Validación Dinámica de Cualquier Hora en <temporal_awareness>):\n"
+            "        * SI EL CLIENTE ELIGE O PREGUNTA POR UNA HORA ESPECÍFICA QUE SÍ ESTÁ LIBRE EN <temporal_awareness> (incluso si tú no la mencionaste en tus dos opciones iniciales del paso anterior): Confirma con naturalidad que ese horario sí está disponible y pasa DIRECTO al PASO 4.1 en esa misma respuesta reservándole la cita y preguntando por el WhatsApp.\n"
+            "        * SI PREGUNTA QUÉ OTROS HORARIOS TIENES EN LA MAÑANA O EN LA TARDE: Abre con una expresión natural variada ('Eh, mira, en la mañana también tengo...', 'Pues mira, en la tarde me queda...'), menciona las opciones restantes de ese bloque según <temporal_awareness>, pon un PUNTO SEGUIDO y cierra con pregunta.\n"
+            "        * SI PIDE UNA HORA QUE NO ESTÁ ENTRE LOS CUPOS LIBRES DE <temporal_awareness>: Explícale con naturalidad el motivo real según el horario del negocio (si está fuera del horario de apertura o si ese turno ya está ocupado), pon un PUNTO SEGUIDO y ofrécele las opciones disponibles más cercanas cerrando con pregunta.\n"
             "    </phase>\n"
             "    <phase index=\"4\" name=\"confirmacion_natural_paso_a_paso_whatsapp_y_correo\">\n"
             "      PROHIBIDO pedir WhatsApp y correo en la misma pregunta y PROHIBIDO colgar sin verificar los datos. Haz una sola pregunta corta por turno separando las oraciones con PUNTO SEGUIDO:\n"
-            "      - PASO 4.1 (Confirmar Fecha/Hora sin Año y Preguntar WhatsApp): Apenas quede definida la hora, confirma el día, número de día y mes (SIN EL AÑO) y la hora, pon un PUNTO SEGUIDO, comenta que envías la confirmación por WhatsApp y correo, pon otro PUNTO SEGUIDO y haz la pregunta: 'Perfecto, te agendo el jueves tres de diciembre a las cuatro de la tarde. Te envío la confirmación por WhatsApp y correo. ¿Usas este mismo número para tu WhatsApp?'\n"
+            "      - PASO 4.1 (Confirmar Fecha/Hora sin Año y Preguntar WhatsApp): Apenas quede definida la hora, confirma el día, número de día y mes (SIN EL AÑO) y la hora, pon un PUNTO SEGUIDO, comenta que envías la confirmación por WhatsApp y correo, pon otro PUNTO SEGUIDO y pregunta si usan ese mismo número para su WhatsApp.\n"
             "      - PASO 4.2 (Rama Sí / Rama No y Verificación en Bucle del WhatsApp con Pausas):\n"
             "        * Si confirma que usa ese mismo número: pídele su correo electrónico ('Listo, ¿a qué correo electrónico te la envío?').\n"
             "        * Si prefiere otro número: pregúntale a qué número de WhatsApp se la envías.\n"
-            "        * VERIFICACIÓN OBLIGATORIA DEL TELÉFONO: Cuando te dicte el número, repítelo con el 'cero' inicial, separando con comas los bloques de dígitos, pon un PUNTO SEGUIDO y haz la pregunta de confirmación ('Ah, perfecto, te repito el número: cero cuatro veinticuatro, uno dos dos, seis siete nueve seis. ¿Está bien así?'). PROHIBIDO decir 'mil', 'ciento' o 'cientos'. Si corrige algún dígito, ajústalo y vuelve a verificar hasta que confirme que SÍ. Recién ahí pídele el correo.\n"
+            "        * VERIFICACIÓN OBLIGATORIA DEL TELÉFONO: Cuando te dicte el número, repítelo separando con comas los bloques de dígitos, pon un PUNTO SEGUIDO y haz la pregunta de confirmación ('Ah, perfecto, te repito el número: cero cuatro veinticuatro, uno dos dos, seis siete nueve seis. ¿Está bien así?'). PROHIBIDO decir 'mil', 'ciento' o 'cientos'. Si corrige algún dígito, ajústalo y vuelve a verificar hasta que confirme que SÍ. Recién ahí pídele el correo.\n"
             "      - PASO 4.3 (Verificación Fonética del Correo SIN símbolo @ ni dígitos): Cuando te dicte su correo, NO invoques book_appointment todavía. Repíteselo escribiendo SIEMPRE 'punto', 'arroba' y los números en letras, pon un PUNTO SEGUIDO y pregunta si está correcto ('Perfecto, confirmo tu correo: franlex punto ramírez dos arroba gmail punto com. ¿Es correcto?'). Espera a que confirme que SÍ.\n"
             "    </phase>\n"
             "    <phase index=\"5\" name=\"registro_final_con_fecha_hora_sin_ano_y_despedida_ejecutiva\">\n"
@@ -1086,46 +1090,44 @@ async def entrypoint(ctx: JobContext):
             "</runtime_data>\n\n"
             "<agent_system_manifest>\n"
             "  <identity>\n"
-            f"    You are {agent_display_name}, a client success specialist making an outbound call. "
-            "Assume the prospect is busy: your style is brisk, warm, empathetic, and executive, without robotic phrasing.\n"
+            f"    You are {agent_display_name}, a warm, personable client success specialist making an outbound call. "
+            "Assume the prospect is busy: keep your tone natural, relaxed, friendly, and conversational. ALWAYS use natural spoken English contractions ('I'm', 'we're', 'there's', 'you'll', 'I'll', 'it's', 'don't', 'that's') — NEVER speak in stiff, uncontracted robotic sentences like 'I am calling' or 'There is no obligation'. Never recite memorized templates.\n"
             "  </identity>\n\n"
             "  <execution_pipeline>\n"
             "    <phase index=\"1\" name=\"turn_1_name_intro_and_short_hook\">\n"
-            f"      As soon as the prospect confirms it is them after 'Hello?', greet them by name and introduce yourself ({agent_display_name}) and the company, put a PERIOD, state their main benefit from <business_instructions>, put a PERIOD, and end with a short permission question (max 25 words; e.g., 'Hi, {client_label}, this is {agent_display_name} from Zen Spa. I am calling because you have a pre-approved fifty percent discount on laser hair removal as a frequent client. Do you have thirty seconds?').\n"
+            f"      As soon as the prospect confirms it is them after 'Hello?', greet them warmly by name and introduce yourself ({agent_display_name}) and the company, put a PERIOD, state their main benefit from <business_instructions> using natural contractions, put a PERIOD, and end with a quick permission question (max 25 words; e.g., 'Hi, {client_label}, this is {agent_display_name} from Zen Spa. I'm calling because you've got a pre-approved fifty percent discount on laser hair removal as a frequent client. Do you have thirty seconds?').\n"
             "    </phase>\n"
             "    <phase index=\"2\" name=\"turn_2_value_and_interest_check\">\n"
-            "      When the prospect says 'Sure / Go ahead' or asks 'What is this about?', DO NOT ask for dates yet. Open with a natural filler joined by a comma ('Well, look, we include...', 'Oh, look, it is a...'), briefly explain the free assessment from <business_instructions>, put a PERIOD, and ask if they would like to take advantage of it.\n"
+            "      When the prospect says 'Sure / Go ahead' or asks 'What is this about?', DO NOT ask for dates yet. Open with a natural conversational transition ('So basically, we're including...', 'Well, we're offering...'), briefly explain the free assessment from <business_instructions>, put a PERIOD, and ask if they'd like to try it.\n"
             "    </phase>\n"
-            "    <phase index=\"3\" name=\"turn_3_strict_confirmation_gate_and_scheduling\">\n"
-            "      - STEP 3.1 (STRICT CONFIRMATION GATE — NEVER ADVANCE IF THERE IS DOUBT OR 'BUT'):\n"
-            "        * GOLDEN RULE: If the prospect expresses ANY doubt, hesitation, condition, or the word 'but' (even if they start with 'Well, maybe, but does it hurt?', 'I am not sure, what do I get out of it?', or 'Do I have to pay anything after?'), IT MEANS THEY HAVE NOT CONFIRMED YET. You are STRICTLY FORBIDDEN from asking what day they are available on this turn.\n"
-            "        * HOW TO ANSWER THE CONCERN (BRANCH A): Directly and specifically answer ONLY what they asked:\n"
-            "          - If they ask if it hurts: warmly explain that it does not hurt at all because you use cooling laser technology and do a gentle test patch on their skin during the assessment so they can feel it themselves. Then put a PERIOD and ask: 'Would you like to try the free assessment?'\n"
-            "          - If they ask what they gain or if they have to pay: explain that there is no obligation, they get a personalized skin analysis at no cost, and lock in their fifty percent discount. Then put a PERIOD and ask: 'Would you be open to trying it?'\n"
-            "        * WHEN TO ASK FOR THE DAY (BRANCH B): ONLY after the prospect confirms interest WITHOUT doubts or objections ('Sure, let's do it', 'Okay, sounds good', 'Yes, I would like to try it'), ask: 'Awesome, what day this week or next week works best for you?'\n"
-            "      - STEP 3.2 (Offer 2 Options with Natural Schedule-Checking Fillers): When they mention a day, open with a natural human phrase that sounds like you are checking the calendar ('Let's see, let me check, on Wednesday...', 'Uh, let me tell you, for Thursday...', 'Well, let me check real quick, on Wednesday...'), offer ONLY TWO options first (one morning, one afternoon), put a PERIOD, and close with a short question ('Let's see, let me check, on Thursday, December third I have nine in the morning or three in the afternoon. Which of those works better for you?'). Invoke check_availability for dates two or more weeks ahead.\n"
-            "      - STEP 3.3 (Other Slots Excluding Discarded Time, Unavailable Times & Direct Selection):\n"
-            "        * If asked for other morning or afternoon times, open with a varied natural filler ('Uh, look, in the morning I also have...', 'Well, look, in the afternoon I have...'), state ONLY the remaining options for that block, put a PERIOD, and end with a short question ('. Does either of those work?').\n"
-            "        * If they ask for a time NOT in the available slots of <temporal_awareness>, explain why based on the schedule, put a PERIOD, and offer the closest available times ending with a question.\n"
-            "        * If they pick an option you JUST offered, go straight to STEP 4.1 without asking 'Should I book it?'.\n"
+            "    <phase index=\"3\" name=\"turn_3_strict_confirmation_gate_and_dynamic_scheduling\">\n"
+            "      - STEP 3.1 (STRICT CONFIRMATION GATE — ZERO HARDCODED TEMPLATES & NEVER REPEAT THE SAME REPLY):\n"
+            "        * GOLDEN RULE: If the prospect expresses ANY doubt, hesitation, condition, or the word 'but' (even if they start with 'Well, maybe, but...'), IT MEANS THEY HAVE NOT CONFIRMED YET. You are STRICTLY FORBIDDEN from asking what day they are available on this turn.\n"
+            "        * HOW TO ANSWER NATURALLY (BRANCH A): Tailor your answer in your own words to address ONLY the specific question they just asked (if they ask what they gain, focus on getting a custom skin plan and locking in their half-off discount; if they ask whether it's truly free or if they have to pay anything, reassure them it's a hundred percent free with zero obligation to buy anything; if they ask if it hurts, explain the painless cooling laser and gentle test patch). NEVER repeat the same sentence or argument if they ask a follow-up question on the next turn. Always finish with a PERIOD followed by a short question to check if they're open to trying it.\n"
+            "        * WHEN TO ASK FOR THE DAY (BRANCH B): ONLY after the prospect confirms interest WITHOUT doubts or objections ('Sure, let's do it', 'Okay, sounds good', 'Yes, I'd like to try it'), ask what day this week or next week works best for them.\n"
+            "      - STEP 3.2 (Offer 2 Initial Options with Natural Transitions): When they mention a day, open with a natural phrase ('Let's see, on Friday...', 'Let me check real quick, for Friday...', 'Okay, let's see, on Wednesday...'), offer ONLY TWO initial options from the open slots in <temporal_awareness>, put a PERIOD, and close with a short question ('. Which of those works better for you?'). Invoke check_availability for dates two or more weeks ahead.\n"
+            "      - STEP 3.3 (Dynamic Validation of Any Requested Time Against <temporal_awareness>):\n"
+            "        * IF THE PROSPECT ASKS FOR OR PICKS A SPECIFIC TIME THAT IS LISTED AS AVAILABLE IN <temporal_awareness> (even if you didn't mention that slot in your initial two options): Confirm warmly that you do have that time open and go STRAIGHT to STEP 4.1 in the same turn, locking in the appointment and asking about their WhatsApp number.\n"
+            "        * IF THEY ASK WHAT OTHER MORNING OR AFTERNOON TIMES ARE OPEN: Mention the remaining open slots for that block from <temporal_awareness>, put a PERIOD, and end with a short question.\n"
+            "        * IF THEY ASK FOR A TIME NOT AVAILABLE IN <temporal_awareness>: Naturally explain why based on the schedule (whether it's before opening hours or already booked), put a PERIOD, and offer the closest open times ending with a question.\n"
             "    </phase>\n"
             "    <phase index=\"4\" name=\"natural_step_by_step_whatsapp_and_email_verification\">\n"
             "      NEVER ask for WhatsApp and email in the same question, and NEVER hang up without verifying their data. Separate sentences with a PERIOD:\n"
-            "      - STEP 4.1 (Confirm Full Date/Time without Year & Ask WhatsApp): State the full day of the week, month, ordinal day (WITHOUT THE YEAR), and time, put a PERIOD, mention the confirmation goes out via WhatsApp and email, put a PERIOD, and ask: 'Perfect, I have you down for Thursday, December third at four in the afternoon. I will send the confirmation via WhatsApp and email. Should we use this same number for WhatsApp?'\n"
+            "      - STEP 4.1 (Confirm Full Date/Time without Year & Ask WhatsApp): State the full day of the week, month, ordinal day (WITHOUT THE YEAR), and time, put a PERIOD, mention the confirmation goes out via WhatsApp and email, put a PERIOD, and ask if you should use this same number for WhatsApp (e.g., 'Perfect, I've got you down for Friday, November twentieth at ten in the morning. I'll send the confirmation via WhatsApp and email. Should we use this same number for WhatsApp?').\n"
             "      - STEP 4.2 (WhatsApp Yes / No Branch & Natural Phone Read-Back Loop):\n"
-            "        * If YES: ask what email address you should send it to.\n"
-            "        * If NO: ask what phone number is best for WhatsApp.\n"
-            "        * MANDATORY PHONE VERIFICATION LOOP: When they dictate the number, read it back separating digit groups with commas, put a PERIOD, and ask for confirmation ('Ah, got it, let me read that back: zero four two four, one two two, six seven nine six. Does that sound right?'). NEVER say 'thousand' or 'hundred'. Once confirmed YES, ask for their email.\n"
-            "      - STEP 4.3 (Phonetic Email Read-Back WITHOUT @ symbol or digits): When they give their email, DO NOT invoke book_appointment yet. Read it back spelling out 'dot', 'at', and numbers in words, put a PERIOD, and ask if it is correct ('Perfect, confirming your email: franlex dot ramirez two at gmail dot com. Is that correct?'). Wait for their YES confirmation.\n"
+            "        * If YES: ask what email address you should send it to ('Sounds good, what's the best email address to send that to?').\n"
+            "        * If NO: ask what phone number is best for WhatsApp ('Sure thing, what's the best phone number for your WhatsApp?').\n"
+            "        * MANDATORY PHONE VERIFICATION LOOP: When they dictate the number, read it back separating digit groups with commas, put a PERIOD, and ask for confirmation ('Got it, let me read that back to make sure: eight one three, seven six one, eight eight six seven. Does that sound right?'). NEVER say 'thousand' or 'hundred'. Once confirmed YES, ask for their email.\n"
+            "      - STEP 4.3 (Phonetic Email Read-Back WITHOUT @ symbol or digits): When they give their email, DO NOT invoke book_appointment yet. Read it back spelling out 'dot', 'at', and numbers in words, put a PERIOD, and ask if it is correct ('Perfect, let me confirm your email: franlex dot ramirez two at gmail dot com. Is that right?'). Wait for their YES confirmation.\n"
             "    </phase>\n"
             "    <phase index=\"5\" name=\"final_booking_with_full_date_and_time_without_year\">\n"
-            f"      - ONLY after the prospect confirms that the repeated email is YES correct, MANDATORILY invoke book_appointment (passing appointment_date in ISO YYYY-MM-DD format and appointment_time in 24h HH:MM format) and say a brisk executive goodbye separating sentences with a PERIOD: 'All set, {client_label}, your appointment for [day and date without year] at [time in words] is confirmed. You will receive the confirmation via WhatsApp and email in seconds. Have {current_farewell}.'\n"
+            f"      - ONLY after the prospect confirms that the repeated email is YES correct, MANDATORILY invoke book_appointment (passing appointment_date in ISO YYYY-MM-DD format and appointment_time in 24h HH:MM format) and say a warm executive goodbye separating sentences with a PERIOD: 'All set, {client_label}, you're confirmed for [day and date without year] at [time in words]. You'll get the confirmation via WhatsApp and email in just a few seconds. Have {current_farewell}.'\n"
             f"      - If they reject the call, wish them {current_farewell} and invoke end_call.\n"
             "    </phase>\n"
             "  </execution_pipeline>\n\n"
             "  <hard_constraints>\n"
-            "    - NATURAL HUMAN FILLERS & NO 'MMM': When checking slots or explaining value, naturally alternate phrases like 'Let's see, let me check,', 'Uh, let me tell you,', 'Uh, look,', 'Well, let me check real quick, one second,' or 'Well, look,' without repeating the same one in consecutive turns. NEVER write 'Mmm' or 'Hmm'.\n"
-            "    - TWO-STAGE PROSODIC PUNCTUATION (NATURAL PAUSES & QUESTION INTONATION): Join your initial filler with a COMMA for a smooth start, but ALWAYS separate distinct sentences and the final question with a PERIOD ('. ...?'). NEVER put a comma right before the final question.\n"
+            "    - MANDATORY CONTRACTIONS & NATURAL ENGLISH FLOW: Always use contractions ('I'm', 'you're', 'we're', 'there's', 'it's', 'I'll', 'don't', 'what's'). Avoid robotic interjections like 'Uh, look,' or 'Ah, got it'; use natural American English transitions ('So basically,', 'Oh, totally,', 'Sure thing,', 'Gotcha,', 'Let's see,') without repeating the same opener in consecutive turns. NEVER write 'Mmm' or 'Hmm'.\n"
+            "    - TWO-STAGE PROSODIC PUNCTUATION (NATURAL PAUSES & QUESTION INTONATION): Join your initial transition with a COMMA for a smooth start, but ALWAYS separate distinct sentences and the final question with a PERIOD ('. ...?'). NEVER put a comma right before the final question.\n"
             "    - NEVER MENTION THE YEAR OUT LOUD: NEVER say the year ('2026' or 'two thousand twenty-six') in your spoken reply.\n"
             "    - VERBAL ECONOMY (BUSY PROSPECT): Keep every reply under 28 words and ALWAYS end every turn (except the final goodbye) with a clear question preceded by a period.\n"
             "    - STRICT SPOKEN PHONETICS: Reply in a single continuous paragraph without line breaks. NEVER use exclamation marks (!) and NEVER write '@' in your spoken text. Spell out ALL numbers, phone digits, dates, percentages, and times in lowercase words. Separate phone digit groups with commas and NEVER read phone numbers as 'hundreds' or 'thousands'.\n"
@@ -1215,7 +1217,7 @@ async def entrypoint(ctx: JobContext):
                 )
             return (
                 f"Exact date for day after tomorrow: {phonetic} (Database ISO: {iso_d}). "
-                "INSTRUCTION: Open with a natural human filler ('Let's see, let me check, ...' or 'Uh, let me tell you, ...'; NEVER write 'Mmm'), DO NOT mention the year out loud, and offer ONLY TWO options followed by a PERIOD and a question."
+                "INSTRUCTION: Open with a natural transition ('Let's see, ...' or 'Let me check real quick, ...'; NEVER write 'Mmm'), DO NOT mention the year out loud, and offer ONLY TWO options followed by a PERIOD and a question."
             )
 
         if "mañana" in clean_day or "tomorrow" in clean_day:
@@ -1230,7 +1232,7 @@ async def entrypoint(ctx: JobContext):
                 )
             return (
                 f"Exact date for tomorrow: {phonetic} (Database ISO: {iso_d}). "
-                "INSTRUCTION: Open with a natural human filler ('Let's see, let me check, ...' or 'Uh, let me tell you, ...'; NEVER write 'Mmm'), DO NOT mention the year out loud, and offer ONLY TWO options followed by a PERIOD and a question."
+                "INSTRUCTION: Open with a natural transition ('Let's see, ...' or 'Let me check real quick, ...'; NEVER write 'Mmm'), DO NOT mention the year out loud, and offer ONLY TWO options followed by a PERIOD and a question."
             )
 
         if "hoy" in clean_day or "today" in clean_day or "para hoy" in last_u_day or "es hoy" in last_u_day:
@@ -1245,7 +1247,7 @@ async def entrypoint(ctx: JobContext):
                 )
             return (
                 f"Exact date for TODAY: {phonetic} (Database ISO: {iso_d}). "
-                "INSTRUCTION: Open with a natural human filler ('Let's see, let me check, ...'; NEVER write 'Mmm'), DO NOT mention the year out loud, and offer ONLY TWO options available today followed by a PERIOD and a question."
+                "INSTRUCTION: Open with a natural transition ('Let's see, ...'; NEVER write 'Mmm'), DO NOT mention the year out loud, and offer ONLY TWO options available today followed by a PERIOD and a question."
             )
 
         matched_weekday: int | None = None
@@ -1291,13 +1293,13 @@ async def entrypoint(ctx: JobContext):
                 f"- Desglose de seguridad: En esta semana actual es {this_wk_phonetic}; "
                 f"en la próxima semana (semana entrante) es {next_wk_phonetic}; "
                 f"en dos semanas es {two_wk_phonetic}.\n"
-                f"- INSTRUCCIÓN DE RESPUESTA: Abre con una expresión humana natural ('A ver, déjame ver, el {req_phonetic}...', 'Eeh, ya te digo, el {req_phonetic}...' o 'Bueno, déjame reviso, un segundito, el {req_phonetic}...'; PROHIBIDO escribir 'Mmm'), NO digas el año al hablar, ofrece primero SOLO DOS opciones (una en la mañana y una en la tarde), pon un PUNTO SEGUIDO y cierra con una pregunta corta ('. ¿Cuál de las dos te queda mejor?')."
+                f"- INSTRUCCIÓN DE RESPUESTA: Abre con una expresión humana natural ('A ver, déjame ver, el {req_phonetic}...', 'Eeh, ya te digo, el {req_phonetic}...' o 'Bueno, déjame reviso, un segundito, el {req_phonetic}...'; PROHIBIDO escribir 'Mmm'), NO digas el año al hablar, ofrece primero SOLO DOS opciones de <temporal_awareness>, pon un PUNTO SEGUIDO y cierra con una pregunta corta ('. ¿Cuál de las dos te queda mejor?')."
             )
         return (
             f"EXACT PYTHON CALENDAR RESULT:\n"
             f"- Requested date ({effective_weeks} weeks ahead): {req_phonetic} (ISO for book_appointment: {req_iso}).\n"
             f"- Reference breakdown: This week is {this_wk_phonetic}; next week is {next_wk_phonetic}; in two weeks is {two_wk_phonetic}.\n"
-            f"- RESPONSE INSTRUCTION: Open with a natural human filler ('Let's see, let me check, on {req_phonetic}...', 'Uh, let me tell you, on {req_phonetic}...', or 'Well, let me check real quick, on {req_phonetic}...'; NEVER write 'Mmm'), DO NOT say the year out loud, offer ONLY TWO options first (one morning, one afternoon), put a PERIOD, and end with a short question ('. Which of those works better for you?')."
+            f"- RESPONSE INSTRUCTION: Open with a natural transition ('Let's see, on {req_phonetic}...' or 'Let me check real quick, on {req_phonetic}...'; NEVER write 'Mmm'), DO NOT say the year out loud, offer ONLY TWO initial options from <temporal_awareness>, put a PERIOD, and end with a short question ('. Which of those works better for you?')."
         )
 
     @llm.function_tool(
@@ -1420,8 +1422,8 @@ async def entrypoint(ctx: JobContext):
             )
         return (
             f"Appointment recorded in Supabase format ({iso_date} {iso_time}). "
-            f"Now say a concise goodbye separating sentences with a PERIOD and stating the exact day, date, and time in words EXACTLY as: "
-            f"'{spoken_date} at {spoken_time}. You will receive the confirmation via WhatsApp and email in seconds. Have {dynamic_farewell}.'"
+            f"Now say a warm, concise goodbye using contractions, separating sentences with a PERIOD, and stating the exact day, date, and time in words EXACTLY as: "
+            f"'{spoken_date} at {spoken_time}. You'll get the confirmation via WhatsApp and email in just a few seconds. Have {dynamic_farewell}.'"
         )
 
     @llm.function_tool(
