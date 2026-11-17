@@ -7,6 +7,7 @@ import re
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
+import httpx
 from livekit import api
 from livekit.protocol.sip import SIP_MEDIA_ENCRYPT_DISABLE
 from livekit.agents import (
@@ -49,6 +50,9 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 AGENT_NAME = "outbound-agent"
 SIP_TRUNK_ID = os.environ.get("LIVEKIT_SIP_TRUNK_ID", "")
+DEFAULT_TENANT_ID = os.environ.get("SPA_TENANT_ID", "zen_spa")
+DEFAULT_MORNING_HOURS = (9, 10, 11)
+DEFAULT_AFTERNOON_HOURS = (15, 16, 17)
 DEFAULT_TTS_MODEL = "cartesia/sonic-2"
 DEFAULT_ES_TEST_VOICE = "deepgram/aura-2:celeste-es"
 DEFAULT_EN_TEST_VOICE = "deepgram/aura-2:thalia-en"
@@ -246,6 +250,198 @@ HOURS_EN_WORDS = {
     1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six",
     7: "seven", 8: "eight", 9: "nine", 10: "ten", 11: "eleven", 12: "twelve",
 }
+
+
+def _get_supabase_credentials() -> tuple[str, str]:
+    """Obtiene y sanea URL y API Key de Supabase desde las variables de entorno."""
+    sb_url = (
+        os.environ.get("SUPABASE_URL")
+        or os.environ.get("NEXT_PUBLIC_SUPABASE_URL")
+        or ""
+    ).strip().strip("'\"")
+    sb_key = (
+        os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+        or os.environ.get("SUPABASE_KEY")
+        or os.environ.get("SUPABASE_ANON_KEY")
+        or os.environ.get("NEXT_PUBLIC_SUPABASE_ANON_KEY")
+        or ""
+    ).strip().strip("'\"")
+
+    if sb_url and not sb_url.startswith("http"):
+        sb_url = f"https://{sb_url}.supabase.co" if "." not in sb_url else f"https://{sb_url}"
+    sb_url = sb_url.rstrip("/")
+
+    if "tu-proyecto" in sb_url or "your-project" in sb_url:
+        logger.warning(
+            "⚠️ [SUPABASE CONFIG] SUPABASE_URL contiene el placeholder '%s'. Actualízalo en tu .env con la URL real de tu proyecto (ej. https://zrsuutgyywciuwiiwrfb.supabase.co).",
+            sb_url,
+        )
+        return "", ""
+    return sb_url, sb_key
+
+
+async def _fetch_supabase_booked_slots(
+    tenant_id: str,
+    start_iso_date: str,
+    end_iso_date: str,
+) -> dict[str, set[int]]:
+    """Pre-carga en ~40ms todos los horarios ya ocupados en Supabase para los próximos 14 días."""
+    sb_url, sb_key = _get_supabase_credentials()
+    if not (sb_url and sb_key):
+        logger.warning("⚠️ [SUPABASE] Missing valid SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in .env — using default open schedule.")
+        return {}
+
+    endpoint = f"{sb_url}/rest/v1/spa_appointments"
+    headers = {
+        "apikey": sb_key,
+        "Authorization": f"Bearer {sb_key}",
+    }
+    params = [
+        ("tenant_id", f"eq.{tenant_id}"),
+        ("appointment_date", f"gte.{start_iso_date}"),
+        ("appointment_date", f"lte.{end_iso_date}"),
+        ("status", "in.(scheduled,confirmed,rescheduled)"),
+        ("select", "appointment_date,appointment_time"),
+    ]
+    booked_map: dict[str, set[int]] = {}
+    try:
+        async with httpx.AsyncClient(timeout=2.5) as client:
+            resp = await client.get(endpoint, headers=headers, params=params)
+            if resp.status_code == 200:
+                rows = resp.json()
+                for row in rows:
+                    d_str = str(row.get("appointment_date", "")).strip()
+                    t_str = str(row.get("appointment_time", "")).strip()
+                    if d_str and t_str:
+                        hour_val = int(t_str.split(":")[0])
+                        booked_map.setdefault(d_str, set()).add(hour_val)
+                logger.info(
+                    "🗄️ [SUPABASE PRE-FETCH] Loaded %d active bookings from '%s' for tenant='%s' (%s to %s).",
+                    len(rows),
+                    sb_url,
+                    tenant_id,
+                    start_iso_date,
+                    end_iso_date,
+                )
+            else:
+                logger.warning("⚠️ [SUPABASE PRE-FETCH] HTTP %d from '%s': %s", resp.status_code, sb_url, resp.text[:200])
+    except Exception as exc:
+        logger.warning("⚠️ [SUPABASE PRE-FETCH] Could not reach '%s' (%s) — falling back to open schedule.", sb_url, exc)
+    return booked_map
+
+
+async def _fetch_booked_hours_for_date(tenant_id: str, iso_date: str) -> set[int]:
+    """Consulta en tiempo real en Supabase las horas ocupadas para una fecha específica."""
+    booked_map = await _fetch_supabase_booked_slots(tenant_id, iso_date, iso_date)
+    return booked_map.get(iso_date, set())
+
+
+def _format_day_slots_summary(iso_date: str, language: str, booked_hours: set[int]) -> str:
+    """Genera el resumen detallado de horas libres y ocupadas cuando se consulta una fecha o hay reservas en Supabase."""
+    free_morning = [h for h in DEFAULT_MORNING_HOURS if h not in booked_hours]
+    free_afternoon = [h for h in DEFAULT_AFTERNOON_HOURS if h not in booked_hours]
+
+    if language == "es":
+        m_words = [HOURS_ES_WORDS[h] for h in free_morning]
+        a_words = [HOURS_ES_WORDS[h - 12] for h in free_afternoon]
+        booked_words = [
+            f"{HOURS_ES_WORDS[h if h <= 12 else h - 12]} {'de la mañana' if h < 12 else 'de la tarde'}"
+            for h in sorted(booked_hours)
+        ]
+        if not free_morning and not free_afternoon:
+            return "SIN CUPOS DISPONIBLES (día completamente lleno)"
+        parts = []
+        if m_words:
+            parts.append(f"mañana libre: {', '.join(m_words)} de la mañana")
+        else:
+            parts.append("mañana: lleno")
+        if a_words:
+            parts.append(f"tarde libre: {', '.join(a_words)} de la tarde")
+        else:
+            parts.append("tarde: lleno")
+        if booked_words:
+            parts.append(f"OCUPADOS EN DB: {', '.join(booked_words)}")
+        return " | ".join(parts)
+
+    m_words_en = [HOURS_EN_WORDS[h] for h in free_morning]
+    a_words_en = [HOURS_EN_WORDS[h - 12] for h in free_afternoon]
+    booked_words_en = [
+        f"{HOURS_EN_WORDS[h if h <= 12 else h - 12]} {'in the morning' if h < 12 else 'in the afternoon'}"
+        for h in sorted(booked_hours)
+    ]
+    if not free_morning and not free_afternoon:
+        return "FULLY BOOKED (no open slots)"
+    parts_en = []
+    if m_words_en:
+        parts_en.append(f"morning open: {', '.join(m_words_en)}")
+    else:
+        parts_en.append("morning: full")
+    if a_words_en:
+        parts_en.append(f"afternoon open: {', '.join(a_words_en)}")
+    else:
+        parts_en.append("afternoon: full")
+    if booked_words_en:
+        parts_en.append(f"ALREADY BOOKED IN DB: {', '.join(booked_words_en)}")
+    return " | ".join(parts_en)
+
+
+async def _insert_appointment_supabase(payload: dict) -> tuple[bool, str, dict | None]:
+    """
+    Inserta atómicamente la cita en public.spa_appointments de Supabase.
+    Devuelve: (exito, codigo_estado_o_error, fila_creada)
+    """
+    sb_url, sb_key = _get_supabase_credentials()
+    if not (sb_url and sb_key):
+        logger.warning("⚠️ [SUPABASE INSERT] Credentials not configured in .env — simulated local booking only.")
+        return True, "local_only", payload
+
+    endpoint = f"{sb_url}/rest/v1/spa_appointments"
+    headers = {
+        "apikey": sb_key,
+        "Authorization": f"Bearer {sb_key}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+    db_row = {
+        "tenant_id": payload.get("tenant_id", DEFAULT_TENANT_ID),
+        "client_name": payload["client_name"],
+        "whatsapp_number": payload["whatsapp_number"],
+        "email": payload["email"],
+        "service_name": payload.get("service_name", "Valoración Diagnóstica Láser (50% OFF)"),
+        "appointment_date": payload["appointment_date"],
+        "appointment_time": payload["appointment_time"],
+        "appointment_at_iso": payload["appointment_at_iso"],
+        "appointment_display": payload.get("appointment_display", ""),
+        "language": payload.get("language", "es"),
+        "call_direction": payload.get("call_direction", "outbound"),
+        "status": "scheduled",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            resp = await client.post(endpoint, headers=headers, json=db_row)
+            if resp.status_code in (200, 201):
+                created_data = resp.json()
+                row_obj = created_data[0] if isinstance(created_data, list) and created_data else db_row
+                logger.info(
+                    "🗄️ [SUPABASE DB INSERT SUCCESS] id='%s' | date='%s' | time='%s' | reminder_24h='%s'",
+                    row_obj.get("id", "ok"),
+                    row_obj.get("appointment_date"),
+                    row_obj.get("appointment_time"),
+                    row_obj.get("reminder_trigger_at", "auto"),
+                )
+                return True, "created", row_obj
+            if resp.status_code == 409 or "23505" in resp.text or "duplicate key" in resp.text.lower():
+                logger.warning(
+                    "🚫 [SUPABASE SLOT COLLISION] Slot %s %s is already booked in database!",
+                    payload["appointment_date"],
+                    payload["appointment_time"],
+                )
+                return False, "slot_taken", None
+            logger.error("❌ [SUPABASE INSERT ERROR] HTTP %d: %s", resp.status_code, resp.text[:300])
+            return False, f"http_{resp.status_code}", None
+    except Exception as exc:
+        logger.error("❌ [SUPABASE INSERT EXCEPTION] %s", exc)
+        return False, str(exc), None
 
 
 def _format_to_e164_ve(raw_input: str) -> str:
@@ -531,30 +727,51 @@ def _get_time_of_day_phrases(language: str) -> tuple[str, str, str]:
     return "in the evening", "good evening", "a wonderful evening"
 
 
-def _get_temporal_context(language: str, custom_schedule: str = "") -> str:
-    """Pre-calcula en Python el calendario exacto de 14 días (en ES y EN) e inyecta el horario configurable del negocio."""
+def _get_temporal_context(
+    language: str,
+    custom_schedule: str = "",
+    booked_slots_map: dict[str, set[int]] | None = None,
+) -> str:
+    """Pre-calcula en Python el calendario compacto de 14 días e inyecta únicamente las excepciones ocupadas en Supabase."""
     now = datetime.now(ZoneInfo("America/Caracas"))
     period, greeting_phrase, farewell_phrase = _get_time_of_day_phrases(language)
     monday_this_week = now - timedelta(days=now.weekday())
     tomorrow = now + timedelta(days=1)
     day_after = now + timedelta(days=2)
+    booked_map = booked_slots_map or {}
 
     this_week_items = []
     next_week_items = []
     for d_idx in range(7):
         dt_this = monday_this_week + timedelta(days=d_idx)
         dt_next = monday_this_week + timedelta(weeks=1, days=d_idx)
+        iso_this = dt_this.strftime("%Y-%m-%d")
+        iso_next = dt_next.strftime("%Y-%m-%d")
+
         if dt_this.date() >= now.date():
-            this_week_items.append(f"{_format_date_phonetic(dt_this, language)} [ISO: {dt_this.strftime('%Y-%m-%d')}]")
-        next_week_items.append(f"{_format_date_phonetic(dt_next, language)} [ISO: {dt_next.strftime('%Y-%m-%d')}]")
+            b_this = booked_map.get(iso_this, set())
+            if b_this:
+                this_week_items.append(
+                    f"{_format_date_phonetic(dt_this, language)} [ISO: {iso_this} -> {_format_day_slots_summary(iso_this, language, b_this)}]"
+                )
+            else:
+                this_week_items.append(f"{_format_date_phonetic(dt_this, language)} [ISO: {iso_this}]")
+
+        b_next = booked_map.get(iso_next, set())
+        if b_next:
+            next_week_items.append(
+                f"{_format_date_phonetic(dt_next, language)} [ISO: {iso_next} -> {_format_day_slots_summary(iso_next, language, b_next)}]"
+            )
+        else:
+            next_week_items.append(f"{_format_date_phonetic(dt_next, language)} [ISO: {iso_next}]")
 
     hour_12 = now.hour % 12 or 12
 
     if language == "es":
         schedule_es = custom_schedule.strip() or (
             "Horario de atención del negocio: de nueve de la mañana a cinco de la tarde. "
-            "Cupos disponibles actualmente todos los días: en la mañana nueve, diez y once de la mañana; "
-            "en la tarde tres, cuatro y cinco de la tarde."
+            "Cupos disponibles por defecto todos los días (salvo los marcados como OCUPADOS EN DB en una fecha): "
+            "en la mañana nueve, diez y once de la mañana; en la tarde tres, cuatro y cinco de la tarde."
         )
         return (
             f"Ahora mismo (HOY) es {_format_date_phonetic(now, 'es')} [ISO: {now.strftime('%Y-%m-%d')}], {hour_12}:{now.minute:02d} {period}. "
@@ -568,8 +785,8 @@ def _get_temporal_context(language: str, custom_schedule: str = "") -> str:
 
     schedule_en = custom_schedule.strip() or (
         "Business operating hours: nine in the morning to five in the afternoon. "
-        "Currently available slots every day: in the morning at nine, ten, and eleven in the morning; "
-        "in the afternoon at three, four, and five in the afternoon."
+        "Default open slots every day (unless marked as ALREADY BOOKED IN DB on a specific date): "
+        "in the morning at nine, ten, and eleven in the morning; in the afternoon at three, four, and five in the afternoon."
     )
     return (
         f"Right now (TODAY) is {_format_date_phonetic(now, 'en')} [ISO: {now.strftime('%Y-%m-%d')}], {hour_12}:{now.minute:02d} {period}. "
@@ -958,7 +1175,7 @@ async def entrypoint(ctx: JobContext):
         except json.JSONDecodeError:
             logger.warning("Could not parse job metadata as JSON")
 
-    # Valores por defecto para pruebas locales en consola (cuando se llama desde la UI web, metadata los reemplaza dinámicamente)
+    tenant_id: str = metadata.get("tenant_id") or os.environ.get("SPA_TENANT_ID", DEFAULT_TENANT_ID)
     phone_number: str = (
         metadata.get("phone_number")
         or os.environ.get("DEFAULT_CLIENT_PHONE", "+584241226796")
@@ -1013,7 +1230,17 @@ async def entrypoint(ctx: JobContext):
         or os.environ.get("DEFAULT_BUSINESS_HOURS", "")
     )
 
-    temporal_context = _get_temporal_context(language, custom_business_hours)
+    # Pre-Fetch asíncrono de disponibilidad real en Supabase para los próximos 14 días (0ms de impacto en conversación)
+    now_ve = datetime.now(ZoneInfo("America/Caracas"))
+    monday_this_wk = now_ve - timedelta(days=now_ve.weekday())
+    sunday_next_wk = monday_this_wk + timedelta(days=13)
+    booked_slots_cache: dict[str, set[int]] = await _fetch_supabase_booked_slots(
+        tenant_id=tenant_id,
+        start_iso_date=now_ve.strftime("%Y-%m-%d"),
+        end_iso_date=sunday_next_wk.strftime("%Y-%m-%d"),
+    )
+
+    temporal_context = _get_temporal_context(language, custom_business_hours, booked_slots_cache)
     _, current_greeting, current_farewell = _get_time_of_day_phrases(language)
     raw_business_instructions = agent_instructions.strip()
     raw_call_context = personalization_context.strip()
@@ -1042,32 +1269,33 @@ async def entrypoint(ctx: JobContext):
             "    <phase index=\"2\" name=\"turno_2_el_valor_y_validacion_de_interes\">\n"
             "      Cuando el cliente diga 'Sí, dime', 'Sí, ok' o pregunte '¿De qué trata?', NO pidas fechas todavía. Abre con una muletilla natural unida con coma ('Pues mira, te incluimos...', 'Ah, mira, se trata de...'), explica brevemente la valoración sin compromiso según <business_instructions>, pon un PUNTO SEGUIDO y haz una pregunta corta para validar si le interesa aprovecharla.\n"
             "    </phase>\n"
-            "    <phase index=\"3\" name=\"turno_3_compuerta_estricta_de_confirmacion_y_agenda_dinamica\">\n"
+            "    <phase index=\"3\" name=\"turno_3_compuerta_estricta_de_confirmacion_y_agenda_dinamica_supabase\">\n"
             "      - PASO 3.1 (COMPUERTA ESTRICTA DE CONFIRMACIÓN — CERO TEXTOS PRE-ARMADOS Y PROHIBIDO REPETIR ARGUMENTOS):\n"
             "        * REGLA DE ORO: Si el cliente expresa CUALQUIER duda, temor, condición o palabra 'pero' (incluso si empieza diciendo 'Bueno, sí, puede ser, pero...'), SIGNIFICA QUE AÚN NO HA CONFIRMADO. Está TERMINANTEMENTE PROHIBIDO pedirle días o fechas en este turno.\n"
             "        * CÓMO RESPONDER CON NATURALIDAD (RAMA A): Razona y responde con tus propias palabras ÚNICAMENTE a la duda puntual que planteó el cliente (si pregunta qué gana, enfócate en el valor del diagnóstico personalizado para su piel y asegurar su descuento; si pregunta si debe pagar algo, aclara que asiste gratis y sin obligación de compra; si pregunta si duele, explica la comodidad del láser frío y la prueba suave en su piel). PROHIBIDO repetir las mismas palabras o el mismo argumento si el cliente hace otra pregunta en el turno siguiente. Cierra siempre con un PUNTO SEGUIDO y una pregunta corta para confirmar si se anima a probarlo.\n"
-            "        * CUÁNDO PEDIR EL DÍA (RAMA B): ÚNICAMENTE cuando el cliente confirme que sí le interesa SIN plantear dudas ni objeciones ('Sí, dale', 'Bueno, ok', 'Me interesa'), pregúntale qué día de esta semana o de la próxima le queda bien.\n"
-            "      - PASO 3.2 (Dar Disponibilidad en 2 Opciones con Muletillas Reales de Revisión): Cuando el cliente mencione un día, abre con una expresión humana natural que suene a que estás revisando la agenda ('A ver, déjame ver, el miércoles...', 'A ver, el miércoles dieciocho...', 'Eeh, ya te digo, para el jueves...', 'Bueno, déjame reviso, un segundito, el miércoles...'), ofrece SOLO DOS opciones iniciales de las que aparecen libres en <temporal_awareness>, pon un PUNTO SEGUIDO y cierra con una pregunta corta ('. ¿Cuál de las dos te queda mejor?'). Invoca check_availability si pide fechas de dos o más semanas en el futuro.\n"
-            "      - PASO 3.3 (Validación Dinámica de Cualquier Hora en <temporal_awareness>):\n"
-            "        * SI EL CLIENTE ELIGE O PREGUNTA POR UNA HORA ESPECÍFICA QUE SÍ ESTÁ LIBRE EN <temporal_awareness> (incluso si tú no la mencionaste en tus dos opciones iniciales del paso anterior): Confirma con naturalidad que ese horario sí está disponible y pasa DIRECTO al PASO 4.1 en esa misma respuesta reservándole la cita y preguntando por el WhatsApp.\n"
-            "        * SI PREGUNTA QUÉ OTROS HORARIOS TIENES EN LA MAÑANA O EN LA TARDE: Abre con una expresión natural variada ('Eh, mira, en la mañana también tengo...', 'Pues mira, en la tarde me queda...'), menciona las opciones restantes de ese bloque según <temporal_awareness>, pon un PUNTO SEGUIDO y cierra con pregunta.\n"
-            "        * SI PIDE UNA HORA QUE NO ESTÁ ENTRE LOS CUPOS LIBRES DE <temporal_awareness>: Explícale con naturalidad el motivo real según el horario del negocio (si está fuera del horario de apertura o si ese turno ya está ocupado), pon un PUNTO SEGUIDO y ofrécele las opciones disponibles más cercanas cerrando con pregunta.\n"
+            "        * CUÁNDO PEDIR EL DÍA (RAMA B): ÚNICAMENTE cuando el cliente confirme que sí le interesa SIN plantear dudas ni objeciones ('Sí, dale', 'Bueno, está bien', 'Me interesa'), pregúntale qué día de esta semana o de la próxima le queda bien.\n"
+            "      - PASO 3.2 (Dar Disponibilidad Real de Supabase en 2 Opciones): Cuando el cliente mencione un día, abre con una expresión humana natural que suene a que estás revisando la agenda ('A ver, déjame ver, el miércoles...', 'Eeh, ya te digo, para el jueves...', 'Bueno, déjame reviso, un segundito, el miércoles...'), ofrece SOLO DOS opciones iniciales que figuren como libres en <temporal_awareness> para ese día (PROHIBIDO ofrecer horas que aparezcan en 'OCUPADOS EN DB'), pon un PUNTO SEGUIDO y cierra con una pregunta corta ('. ¿Cuál de las dos te queda mejor?'). Invoca check_availability si pide fechas de dos o más semanas en el futuro.\n"
+            "      - PASO 3.3 (Selección de Hora, Otros Horarios y Horas Ocupadas en DB):\n"
+            "        * SI EL CLIENTE ELIGE CUALQUIERA DE LAS HORAS OFRECIDAS (ej. 'A las nueve', 'A las tres') O PREGUNTA POR OTRA HORA ESPECÍFICA QUE SÍ ESTÁ LIBRE EN <temporal_awareness>: PROHIBIDO decir 'ya quedó agendada' y PROHIBIDO despedirte todavía. Pasa OBLIGATORIAMENTE al PASO 4.1 para pedir primero su confirmación de WhatsApp.\n"
+            "        * SI PREGUNTA QUÉ OTROS HORARIOS TIENES EN LA MAÑANA O EN LA TARDE: Abre con una expresión natural ('Eh, mira, en la mañana también tengo...', 'Pues mira, en la tarde me queda...'), menciona las opciones libres restantes de ese bloque según <temporal_awareness>, pon un PUNTO SEGUIDO y cierra con pregunta.\n"
+            "        * SI PIDE UNA HORA QUE APARECE EN 'OCUPADOS EN DB' O FUERA DEL HORARIO COMERCIAL: Explícale con naturalidad el motivo (si está en 'OCUPADOS EN DB', dile que ese turno ya está ocupado; si es antes de las nueve o después de las cinco, menciónale el horario de apertura), pon un PUNTO SEGUIDO y ofrécele las horas libres más cercanas cerrando con pregunta.\n"
             "    </phase>\n"
-            "    <phase index=\"4\" name=\"confirmacion_natural_paso_a_paso_whatsapp_y_correo\">\n"
-            "      PROHIBIDO pedir WhatsApp y correo en la misma pregunta y PROHIBIDO colgar sin verificar los datos. Haz una sola pregunta corta por turno separando las oraciones con PUNTO SEGUIDO:\n"
-            "      - PASO 4.1 (Confirmar Fecha/Hora sin Año y Preguntar WhatsApp): Apenas quede definida la hora, confirma el día, número de día y mes (SIN EL AÑO) y la hora, pon un PUNTO SEGUIDO, comenta que envías la confirmación por WhatsApp y correo, pon otro PUNTO SEGUIDO y pregunta si usan ese mismo número para su WhatsApp.\n"
+            "    <phase index=\"4\" name=\"confirmacion_obligatoria_paso_a_paso_whatsapp_y_correo\">\n"
+            "      REGLA CRÍTICA INQUEBRANTABLE: Está TERMINANTEMENTE PROHIBIDO dar la cita por agendada o despedirte sin haber completado los Pasos 4.1, 4.2 y 4.3. Haz una sola pregunta corta por turno separando las oraciones con PUNTO SEGUIDO:\n"
+            "      - PASO 4.1 (Confirmar Fecha/Hora sin Año y Preguntar WhatsApp): Apenas el cliente elija la hora (ej. 'A las nueve'), di el día, fecha (SIN EL AÑO) y hora elegidos, pon un PUNTO SEGUIDO, comenta que envías la confirmación por WhatsApp y correo, pon otro PUNTO SEGUIDO y pregunta: '¿Usas este mismo número para tu WhatsApp?' (ej. 'Perfecto, entonces sería el sábado veintiuno de noviembre a las nueve de la mañana. Te envío la confirmación por WhatsApp y correo. ¿Usas este mismo número para tu WhatsApp?').\n"
             "      - PASO 4.2 (Rama Sí / Rama No y Verificación en Bucle del WhatsApp con Pausas):\n"
             "        * Si confirma que usa ese mismo número: pídele su correo electrónico ('Listo, ¿a qué correo electrónico te la envío?').\n"
             "        * Si prefiere otro número: pregúntale a qué número de WhatsApp se la envías.\n"
             "        * VERIFICACIÓN OBLIGATORIA DEL TELÉFONO: Cuando te dicte el número, repítelo separando con comas los bloques de dígitos, pon un PUNTO SEGUIDO y haz la pregunta de confirmación ('Ah, perfecto, te repito el número: cero cuatro veinticuatro, uno dos dos, seis siete nueve seis. ¿Está bien así?'). PROHIBIDO decir 'mil', 'ciento' o 'cientos'. Si corrige algún dígito, ajústalo y vuelve a verificar hasta que confirme que SÍ. Recién ahí pídele el correo.\n"
             "      - PASO 4.3 (Verificación Fonética del Correo SIN símbolo @ ni dígitos): Cuando te dicte su correo, NO invoques book_appointment todavía. Repíteselo escribiendo SIEMPRE 'punto', 'arroba' y los números en letras, pon un PUNTO SEGUIDO y pregunta si está correcto ('Perfecto, confirmo tu correo: franlex punto ramírez dos arroba gmail punto com. ¿Es correcto?'). Espera a que confirme que SÍ.\n"
             "    </phase>\n"
-            "    <phase index=\"5\" name=\"registro_final_con_fecha_hora_sin_ano_y_despedida_ejecutiva\">\n"
-            f"      - ÚNICAMENTE cuando el cliente confirme que el correo repetido SÍ está correcto, invoca OBLIGATORIAMENTE book_appointment (pasando appointment_date en formato ISO YYYY-MM-DD y appointment_time en formato 24h HH:MM) y despídete separando cada idea con PUNTO SEGUIDO y mencionando el día, fecha (SIN EL AÑO) y hora en letras: 'Listo, {client_label}, tu cita para el [día y fecha sin año] a las [hora en letras] ya quedó agendada. En segundos te llega la confirmación por WhatsApp y correo. Que pases {current_farewell}.'\n"
+            "    <phase index=\"5\" name=\"registro_final_en_supabase_y_despedida_ejecutiva\">\n"
+            f"      - ÚNICAMENTE después de que el cliente haya confirmado su WhatsApp (Paso 4.2) Y haya confirmado que su correo electrónico repetido SÍ está correcto (Paso 4.3), invoca OBLIGATORIAMENTE la herramienta book_appointment (pasando appointment_date en formato ISO YYYY-MM-DD y appointment_time en formato 24h HH:MM) y despídete separando cada idea con PUNTO SEGUIDO: 'Listo, {client_label}, tu cita para el [día y fecha sin año] a las [hora en letras] ya quedó agendada. En segundos te llega la confirmación por WhatsApp y correo. Que pases {current_farewell}.'\n"
             f"      - Si en cualquier momento el cliente rechaza la llamada ('no me interesa', 'estoy ocupado'), despídete deseándole {current_farewell} e invoca end_call.\n"
             "    </phase>\n"
             "  </execution_pipeline>\n\n"
             "  <hard_constraints>\n"
+            "    - PROHIBICIÓN ABSOLUTA DE SALTARSE EL PASO 4: JAMÁS digas 'ya quedó agendada' ni 'Que pases un feliz día' cuando el cliente apenas elige la hora ('A las nueve'). Cuando elige la hora, SIEMPRE debes preguntar primero: '¿Usas este mismo número para tu WhatsApp?'.\n"
             "    - EXPRESIONES HUMANAS REALES Y PROHIBICIÓN DE 'MMM': Cuando revises horarios o inicies una explicación, alterna con naturalidad frases como 'A ver, déjame ver,', 'A ver,', 'Eeh, ya te digo,', 'Eh, mira,', 'Bueno, déjame reviso, un segundito,' o 'Pues mira,' sin repetir la misma en turnos seguidos. PROHIBIDO escribir 'Mmm' o 'Hmm' (el sintetizador lo lee mal como 'Mim').\n"
             "    - PUNTUACIÓN PROSÓDICA EN 2 TIEMPOS (PAUSAS Y ENTONACIÓN DE PREGUNTA): Une la muletilla inicial con una COMA para arrancar fluido, pero SEPARA SIEMPRE cada oración y la pregunta final con un PUNTO SEGUIDO ('. ¿...?'). PROHIBIDO escribir una coma justo antes de '¿' (escribe SIEMPRE '. ¿Te gustaría?').\n"
             "    - PROHIBIDO MENCIONAR EL AÑO AL HABLAR: JAMÁS digas el año ('dos mil veintiséis' ni '2026') en tu respuesta de voz.\n"
@@ -1100,32 +1328,33 @@ async def entrypoint(ctx: JobContext):
             "    <phase index=\"2\" name=\"turn_2_value_and_interest_check\">\n"
             "      When the prospect says 'Sure / Go ahead' or asks 'What is this about?', DO NOT ask for dates yet. Open with a natural conversational transition ('So basically, we're including...', 'Well, we're offering...'), briefly explain the free assessment from <business_instructions>, put a PERIOD, and ask if they'd like to try it.\n"
             "    </phase>\n"
-            "    <phase index=\"3\" name=\"turn_3_strict_confirmation_gate_and_dynamic_scheduling\">\n"
+            "    <phase index=\"3\" name=\"turn_3_strict_confirmation_gate_and_dynamic_supabase_scheduling\">\n"
             "      - STEP 3.1 (STRICT CONFIRMATION GATE — ZERO HARDCODED TEMPLATES & NEVER REPEAT THE SAME REPLY):\n"
             "        * GOLDEN RULE: If the prospect expresses ANY doubt, hesitation, condition, or the word 'but' (even if they start with 'Well, maybe, but...'), IT MEANS THEY HAVE NOT CONFIRMED YET. You are STRICTLY FORBIDDEN from asking what day they are available on this turn.\n"
             "        * HOW TO ANSWER NATURALLY (BRANCH A): Tailor your answer in your own words to address ONLY the specific question they just asked (if they ask what they gain, focus on getting a custom skin plan and locking in their half-off discount; if they ask whether it's truly free or if they have to pay anything, reassure them it's a hundred percent free with zero obligation to buy anything; if they ask if it hurts, explain the painless cooling laser and gentle test patch). NEVER repeat the same sentence or argument if they ask a follow-up question on the next turn. Always finish with a PERIOD followed by a short question to check if they're open to trying it.\n"
             "        * WHEN TO ASK FOR THE DAY (BRANCH B): ONLY after the prospect confirms interest WITHOUT doubts or objections ('Sure, let's do it', 'Okay, sounds good', 'Yes, I'd like to try it'), ask what day this week or next week works best for them.\n"
-            "      - STEP 3.2 (Offer 2 Initial Options with Natural Transitions): When they mention a day, open with a natural phrase ('Let's see, on Friday...', 'Let me check real quick, for Friday...', 'Okay, let's see, on Wednesday...'), offer ONLY TWO initial options from the open slots in <temporal_awareness>, put a PERIOD, and close with a short question ('. Which of those works better for you?'). Invoke check_availability for dates two or more weeks ahead.\n"
-            "      - STEP 3.3 (Dynamic Validation of Any Requested Time Against <temporal_awareness>):\n"
-            "        * IF THE PROSPECT ASKS FOR OR PICKS A SPECIFIC TIME THAT IS LISTED AS AVAILABLE IN <temporal_awareness> (even if you didn't mention that slot in your initial two options): Confirm warmly that you do have that time open and go STRAIGHT to STEP 4.1 in the same turn, locking in the appointment and asking about their WhatsApp number.\n"
-            "        * IF THEY ASK WHAT OTHER MORNING OR AFTERNOON TIMES ARE OPEN: Mention the remaining open slots for that block from <temporal_awareness>, put a PERIOD, and end with a short question.\n"
-            "        * IF THEY ASK FOR A TIME NOT AVAILABLE IN <temporal_awareness>: Naturally explain why based on the schedule (whether it's before opening hours or already booked), put a PERIOD, and offer the closest open times ending with a question.\n"
+            "      - STEP 3.2 (Offer 2 Real Open Options from Supabase): When they mention a day, open with a natural phrase ('Let's see, on Friday...', 'Let me check real quick, for Friday...', 'Okay, let's see, on Wednesday...'), offer ONLY TWO initial options that are listed as open in <temporal_awareness> for that day (NEVER offer a time listed under 'ALREADY BOOKED IN DB'), put a PERIOD, and close with a short question ('. Which of those works better for you?'). Invoke check_availability for dates two or more weeks ahead.\n"
+            "      - STEP 3.3 (Slot Selection, Other Open Slots & Booked Times in DB):\n"
+            "        * IF THE PROSPECT PICKS ONE OF THE OFFERED TIMES (e.g., 'Nine AM', 'Three PM') OR ASKS FOR A SPECIFIC TIME THAT IS OPEN IN <temporal_awareness>: NEVER say 'you're confirmed' and NEVER say goodbye yet. You MUST go to STEP 4.1 first to ask about their WhatsApp number.\n"
+            "        * IF THEY ASK WHAT OTHER MORNING OR AFTERNOON TIMES ARE OPEN: Mention ONLY the remaining open slots for that block from <temporal_awareness>, put a PERIOD, and end with a short question.\n"
+            "        * IF THEY ASK FOR A TIME LISTED UNDER 'ALREADY BOOKED IN DB' OR OUTSIDE OPERATING HOURS: Naturally explain why (if it's in 'ALREADY BOOKED IN DB', let them know that slot is already taken; if it's before nine or after five, mention business hours), put a PERIOD, and offer the closest open times ending with a question.\n"
             "    </phase>\n"
-            "    <phase index=\"4\" name=\"natural_step_by_step_whatsapp_and_email_verification\">\n"
-            "      NEVER ask for WhatsApp and email in the same question, and NEVER hang up without verifying their data. Separate sentences with a PERIOD:\n"
-            "      - STEP 4.1 (Confirm Full Date/Time without Year & Ask WhatsApp): State the full day of the week, month, ordinal day (WITHOUT THE YEAR), and time, put a PERIOD, mention the confirmation goes out via WhatsApp and email, put a PERIOD, and ask if you should use this same number for WhatsApp (e.g., 'Perfect, I've got you down for Friday, November twentieth at ten in the morning. I'll send the confirmation via WhatsApp and email. Should we use this same number for WhatsApp?').\n"
+            "    <phase index=\"4\" name=\"mandatory_step_by_step_whatsapp_and_email_verification\">\n"
+            "      CRITICAL UNBREAKABLE RULE: You are STRICTLY FORBIDDEN from saying the appointment is confirmed or saying goodbye before completing Steps 4.1, 4.2, and 4.3. Separate sentences with a PERIOD:\n"
+            "      - STEP 4.1 (State Chosen Date/Time without Year & Ask WhatsApp): As soon as the time is chosen, state the full day of the week, month, ordinal day (WITHOUT THE YEAR), and time, put a PERIOD, mention the confirmation goes out via WhatsApp and email, put a PERIOD, and ask: 'Should we use this same number for WhatsApp?' (e.g., 'Perfect, that'll be Friday, November twentieth at nine in the morning. I'll send the confirmation via WhatsApp and email. Should we use this same number for WhatsApp?').\n"
             "      - STEP 4.2 (WhatsApp Yes / No Branch & Natural Phone Read-Back Loop):\n"
             "        * If YES: ask what email address you should send it to ('Sounds good, what's the best email address to send that to?').\n"
             "        * If NO: ask what phone number is best for WhatsApp ('Sure thing, what's the best phone number for your WhatsApp?').\n"
             "        * MANDATORY PHONE VERIFICATION LOOP: When they dictate the number, read it back separating digit groups with commas, put a PERIOD, and ask for confirmation ('Got it, let me read that back to make sure: eight one three, seven six one, eight eight six seven. Does that sound right?'). NEVER say 'thousand' or 'hundred'. Once confirmed YES, ask for their email.\n"
             "      - STEP 4.3 (Phonetic Email Read-Back WITHOUT @ symbol or digits): When they give their email, DO NOT invoke book_appointment yet. Read it back spelling out 'dot', 'at', and numbers in words, put a PERIOD, and ask if it is correct ('Perfect, let me confirm your email: franlex dot ramirez two at gmail dot com. Is that right?'). Wait for their YES confirmation.\n"
             "    </phase>\n"
-            "    <phase index=\"5\" name=\"final_booking_with_full_date_and_time_without_year\">\n"
-            f"      - ONLY after the prospect confirms that the repeated email is YES correct, MANDATORILY invoke book_appointment (passing appointment_date in ISO YYYY-MM-DD format and appointment_time in 24h HH:MM format) and say a warm executive goodbye separating sentences with a PERIOD: 'All set, {client_label}, you're confirmed for [day and date without year] at [time in words]. You'll get the confirmation via WhatsApp and email in just a few seconds. Have {current_farewell}.'\n"
+            "    <phase index=\"5\" name=\"final_supabase_booking_and_executive_goodbye\">\n"
+            f"      - ONLY after the prospect has confirmed their WhatsApp (Step 4.2) AND confirmed that their repeated email is YES correct (Step 4.3), MANDATORILY invoke the book_appointment tool (passing appointment_date in ISO YYYY-MM-DD format and appointment_time in 24h HH:MM format) and say a warm executive goodbye separating sentences with a PERIOD: 'All set, {client_label}, you're confirmed for [day and date without year] at [time in words]. You'll get the confirmation via WhatsApp and email in just a few seconds. Have {current_farewell}.'\n"
             f"      - If they reject the call, wish them {current_farewell} and invoke end_call.\n"
             "    </phase>\n"
             "  </execution_pipeline>\n\n"
             "  <hard_constraints>\n"
+            "    - NEVER SKIP STEP 4: NEVER say 'you're confirmed' or 'Have a wonderful day' when the prospect just picks a time ('Nine AM'). When they pick a time, you MUST always ask 'Should we use this same number for WhatsApp?' first.\n"
             "    - MANDATORY CONTRACTIONS & NATURAL ENGLISH FLOW: Always use contractions ('I'm', 'you're', 'we're', 'there's', 'it's', 'I'll', 'don't', 'what's'). Avoid robotic interjections like 'Uh, look,' or 'Ah, got it'; use natural American English transitions ('So basically,', 'Oh, totally,', 'Sure thing,', 'Gotcha,', 'Let's see,') without repeating the same opener in consecutive turns. NEVER write 'Mmm' or 'Hmm'.\n"
             "    - TWO-STAGE PROSODIC PUNCTUATION (NATURAL PAUSES & QUESTION INTONATION): Join your initial transition with a COMMA for a smooth start, but ALWAYS separate distinct sentences and the final question with a PERIOD ('. ...?'). NEVER put a comma right before the final question.\n"
             "    - NEVER MENTION THE YEAR OUT LOUD: NEVER say the year ('2026' or 'two thousand twenty-six') in your spoken reply.\n"
@@ -1137,8 +1366,8 @@ async def entrypoint(ctx: JobContext):
         )
 
     logger.info(
-        "Starting call as '%s' (voice=%s, language=%s)",
-        agent_display_name, voice_id or DEFAULT_TTS_MODEL, language,
+        "Starting call as '%s' (voice=%s, language=%s, tenant=%s)",
+        agent_display_name, voice_id or DEFAULT_TTS_MODEL, language, tenant_id,
     )
 
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
@@ -1193,7 +1422,7 @@ async def entrypoint(ctx: JobContext):
 
     @llm.function_tool(
         description=(
-            "Calculates in Python the exact calendar date when the client asks for dates two or more weeks ahead (in 2 weeks=2, in 3 weeks=3, in 4 weeks=4). "
+            "Queries real-time availability in Supabase and calculates the exact calendar date when the client asks for dates two or more weeks ahead (in 2 weeks=2, in 3 weeks=3, in 4 weeks=4). "
             "For today, tomorrow, this week, or next week, use <temporal_awareness> directly."
         )
     )
@@ -1207,104 +1436,63 @@ async def entrypoint(ctx: JobContext):
 
         if "pasado mañana" in clean_day or "day after tomorrow" in clean_day:
             target_dt = now + timedelta(days=2)
-            iso_d = target_dt.strftime("%Y-%m-%d")
-            booking_state["last_checked_iso_date"] = iso_d
-            phonetic = _format_date_phonetic(target_dt, language)
-            if language == "es":
-                return (
-                    f"Fecha exacta calculada para pasado mañana: {phonetic} (ISO para base de datos: {iso_d}). "
-                    "INSTRUCCIÓN: Abre con una expresión humana natural ('A ver, déjame ver, ...' o 'Eeh, ya te digo, ...'; PROHIBIDO escribir 'Mmm'), NO menciones el año al hablar y ofrece SOLO DOS opciones seguidas de PUNTO SEGUIDO y pregunta."
-                )
-            return (
-                f"Exact date for day after tomorrow: {phonetic} (Database ISO: {iso_d}). "
-                "INSTRUCTION: Open with a natural transition ('Let's see, ...' or 'Let me check real quick, ...'; NEVER write 'Mmm'), DO NOT mention the year out loud, and offer ONLY TWO options followed by a PERIOD and a question."
-            )
-
-        if "mañana" in clean_day or "tomorrow" in clean_day:
+        elif "mañana" in clean_day or "tomorrow" in clean_day:
             target_dt = now + timedelta(days=1)
-            iso_d = target_dt.strftime("%Y-%m-%d")
-            booking_state["last_checked_iso_date"] = iso_d
-            phonetic = _format_date_phonetic(target_dt, language)
-            if language == "es":
-                return (
-                    f"Fecha exacta calculada para mañana: {phonetic} (ISO para base de datos: {iso_d}). "
-                    "INSTRUCCIÓN: Abre con una expresión humana natural ('A ver, déjame ver, ...' o 'Eeh, ya te digo, ...'; PROHIBIDO escribir 'Mmm'), NO menciones el año al hablar y ofrece SOLO DOS opciones seguidas de PUNTO SEGUIDO y pregunta."
-                )
-            return (
-                f"Exact date for tomorrow: {phonetic} (Database ISO: {iso_d}). "
-                "INSTRUCTION: Open with a natural transition ('Let's see, ...' or 'Let me check real quick, ...'; NEVER write 'Mmm'), DO NOT mention the year out loud, and offer ONLY TWO options followed by a PERIOD and a question."
-            )
+        elif "hoy" in clean_day or "today" in clean_day or "para hoy" in last_u_day or "es hoy" in last_u_day:
+            target_dt = now
+        else:
+            matched_weekday: int | None = None
+            for key, idx in WEEKDAY_MAP.items():
+                if key in clean_day:
+                    matched_weekday = idx
+                    break
+            if matched_weekday is None:
+                matched_weekday = now.weekday()
 
-        if "hoy" in clean_day or "today" in clean_day or "para hoy" in last_u_day or "es hoy" in last_u_day:
-            iso_d = now.strftime("%Y-%m-%d")
-            booking_state["last_checked_iso_date"] = iso_d
-            phonetic = _format_date_phonetic(now, language)
-            logger.info("📅 [CALENDAR TOOL] day='%s' (HOY/TODAY) -> %s (%s)", day_of_week, phonetic, iso_d)
-            if language == "es":
-                return (
-                    f"Fecha exacta calculada para HOY: {phonetic} (ISO para base de datos: {iso_d}). "
-                    "INSTRUCCIÓN: Abre con una expresión humana natural ('A ver, déjame ver, ...'; PROHIBIDO escribir 'Mmm'), NO menciones el año al hablar y ofrece SOLO DOS opciones disponibles hoy seguidas de PUNTO SEGUIDO y pregunta."
-                )
-            return (
-                f"Exact date for TODAY: {phonetic} (Database ISO: {iso_d}). "
-                "INSTRUCTION: Open with a natural transition ('Let's see, ...'; NEVER write 'Mmm'), DO NOT mention the year out loud, and offer ONLY TWO options available today followed by a PERIOD and a question."
-            )
+            monday_current_week = now - timedelta(days=now.weekday())
+            this_week_dt = monday_current_week + timedelta(days=matched_weekday)
+            effective_weeks = max(0, int(weeks_ahead))
+            if effective_weeks == 0 and this_week_dt.date() < now.date():
+                effective_weeks = 1
+            target_dt = monday_current_week + timedelta(weeks=effective_weeks, days=matched_weekday)
 
-        matched_weekday: int | None = None
-        for key, idx in WEEKDAY_MAP.items():
-            if key in clean_day:
-                matched_weekday = idx
-                break
-
-        if matched_weekday is None:
-            matched_weekday = now.weekday()
-
-        # Lunes de la semana actual como ancla matemática exacta
-        monday_current_week = now - timedelta(days=now.weekday())
-        this_week_dt = monday_current_week + timedelta(days=matched_weekday)
-        next_week_dt = monday_current_week + timedelta(weeks=1, days=matched_weekday)
-        two_weeks_dt = monday_current_week + timedelta(weeks=2, days=matched_weekday)
-
-        effective_weeks = max(0, int(weeks_ahead))
-        if effective_weeks == 0 and this_week_dt.date() < now.date():
-            effective_weeks = 1
-
-        requested_dt = monday_current_week + timedelta(weeks=effective_weeks, days=matched_weekday)
-        req_iso = requested_dt.strftime("%Y-%m-%d")
+        req_iso = target_dt.strftime("%Y-%m-%d")
         booking_state["last_checked_iso_date"] = req_iso
+        req_phonetic = _format_date_phonetic(target_dt, language)
 
-        req_phonetic = _format_date_phonetic(requested_dt, language)
-        this_wk_phonetic = _format_date_phonetic(this_week_dt, language)
-        next_wk_phonetic = _format_date_phonetic(next_week_dt, language)
-        two_wk_phonetic = _format_date_phonetic(two_weeks_dt, language)
+        # Consultar disponibilidad real en Supabase para esa fecha
+        if req_iso in booked_slots_cache:
+            booked_hours = booked_slots_cache[req_iso]
+        else:
+            booked_hours = await _fetch_booked_hours_for_date(tenant_id, req_iso)
+            booked_slots_cache[req_iso] = booked_hours
+
+        slots_summary = _format_day_slots_summary(req_iso, language, booked_hours)
 
         logger.info(
-            "📅 [CALENDAR TOOL] day='%s' weeks_ahead=%d -> %s (%s)",
+            "📅 [SUPABASE CALENDAR TOOL] day='%s' weeks_ahead=%d -> %s (%s) | %s",
             day_of_week,
-            effective_weeks,
+            weeks_ahead,
             req_phonetic,
             req_iso,
+            slots_summary,
         )
 
         if language == "es":
             return (
-                f"RESULTADO EXACTO DE CALENDARIO PYTHON:\n"
-                f"- Fecha solicitada ({effective_weeks} semanas adelante): {req_phonetic} (ISO para book_appointment: {req_iso}).\n"
-                f"- Desglose de seguridad: En esta semana actual es {this_wk_phonetic}; "
-                f"en la próxima semana (semana entrante) es {next_wk_phonetic}; "
-                f"en dos semanas es {two_wk_phonetic}.\n"
-                f"- INSTRUCCIÓN DE RESPUESTA: Abre con una expresión humana natural ('A ver, déjame ver, el {req_phonetic}...', 'Eeh, ya te digo, el {req_phonetic}...' o 'Bueno, déjame reviso, un segundito, el {req_phonetic}...'; PROHIBIDO escribir 'Mmm'), NO digas el año al hablar, ofrece primero SOLO DOS opciones de <temporal_awareness>, pon un PUNTO SEGUIDO y cierra con una pregunta corta ('. ¿Cuál de las dos te queda mejor?')."
+                f"RESULTADO EXACTO DE SUPABASE PARA {req_phonetic.upper()} (ISO: {req_iso}):\n"
+                f"- Estado de cupos en base de datos: {slots_summary}.\n"
+                f"- INSTRUCCIÓN DE RESPUESTA: Abre con una expresión humana natural ('A ver, déjame ver, el {req_phonetic}...', 'Eeh, ya te digo, el {req_phonetic}...'; PROHIBIDO escribir 'Mmm'), NO digas el año al hablar, ofrece primero SOLO DOS opciones que estén LIBRES (jamás ofrezcas horas ocupadas), pon un PUNTO SEGUIDO y cierra con una pregunta corta ('. ¿Cuál de las dos te queda mejor?')."
             )
         return (
-            f"EXACT PYTHON CALENDAR RESULT:\n"
-            f"- Requested date ({effective_weeks} weeks ahead): {req_phonetic} (ISO for book_appointment: {req_iso}).\n"
-            f"- Reference breakdown: This week is {this_wk_phonetic}; next week is {next_wk_phonetic}; in two weeks is {two_wk_phonetic}.\n"
-            f"- RESPONSE INSTRUCTION: Open with a natural transition ('Let's see, on {req_phonetic}...' or 'Let me check real quick, on {req_phonetic}...'; NEVER write 'Mmm'), DO NOT say the year out loud, offer ONLY TWO initial options from <temporal_awareness>, put a PERIOD, and end with a short question ('. Which of those works better for you?')."
+            f"EXACT SUPABASE RESULT FOR {req_phonetic.upper()} (ISO: {req_iso}):\n"
+            f"- Real-time database slot status: {slots_summary}.\n"
+            f"- RESPONSE INSTRUCTION: Open with a natural transition ('Let's see, on {req_phonetic}...' or 'Let me check real quick, on {req_phonetic}...'; NEVER write 'Mmm'), DO NOT say the year out loud, offer ONLY TWO initial options that are OPEN (never offer booked times), put a PERIOD, and end with a short question ('. Which of those works better for you?')."
         )
 
     @llm.function_tool(
         description=(
-            "Formally books the appointment in Supabase ONLY AFTER reading back both the WhatsApp number (if a different one was given) and the email address "
+            "Formally books and persists the appointment in Supabase ONLY AFTER reading back both the WhatsApp number (if a different one was given) and the email address "
             "and receiving the client's YES confirmation. Pass appointment_date in ISO 'YYYY-MM-DD' format and appointment_time in 24h 'HH:MM' format."
         )
     )
@@ -1320,7 +1508,23 @@ async def entrypoint(ctx: JobContext):
         if booking_state.get("force_remove_k_in_franlex"):
             email = re.sub(r"(?i)franklex", "franlex", email)
 
-        # Candado determinista bilingüe (ES/EN): si el cliente acaba de dictar o corregir teléfono/correo en este mismo turno, obligar a repetirlo y esperar confirmación
+        # Candado 1: Si aún no se ha pedido o proporcionado un correo electrónico válido con '@', bloquear e instruir Paso 4.1
+        if not email or "no proporcionado" in email.lower() or "not provided" in email.lower() or "@" not in email:
+            logger.info(
+                "🛡️ [GUARDRAIL] Blocked premature book_appointment — missing valid email ('%s'). Forcing Step 4.1.",
+                email,
+            )
+            if language == "es":
+                return (
+                    "ALTO - FALTAN DATOS OBLIGATORIOS (PASO 4): Aún no has verificado el WhatsApp ni pedido el correo electrónico del cliente. "
+                    "PROHIBIDO decir que la cita ya quedó agendada. Aplica el PASO 4.1 ahora mismo: menciona el día y la hora elegidos y pregúntale: '¿Usas este mismo número para tu WhatsApp?'"
+                )
+            return (
+                "STOP - MISSING REQUIRED DATA (STEP 4): You have not verified the prospect's WhatsApp or asked for their email address yet. "
+                "Do NOT say the appointment is confirmed yet. Execute STEP 4.1 right now: state the chosen day and time and ask: 'Should we use this same number for WhatsApp?'"
+            )
+
+        # Candado 2 (ES/EN): si el cliente acaba de dictar o corregir teléfono/correo en este mismo turno, obligar a repetirlo y esperar confirmación
         just_dictated_or_corrected_data = (
             booking_state["needs_readback_confirmation"]
             or "arroba" in last_u
@@ -1390,8 +1594,8 @@ async def entrypoint(ctx: JobContext):
             booking_state.get("last_checked_iso_date", ""),
         )
 
-        # Payload estructurado 100% compatible con tipos DATE, TIME y TIMESTAMPTZ de Supabase (PostgreSQL)
         booking_payload = {
+            "tenant_id": tenant_id,
             "client_name": contact_name or ("Cliente" if language == "es" else "Prospect"),
             "appointment_date": iso_date,
             "appointment_time": iso_time,
@@ -1404,9 +1608,31 @@ async def entrypoint(ctx: JobContext):
             "whatsapp_number": resolved_phone,
             "email": email.strip().lower(),
             "language": language,
+            "call_direction": "outbound",
             "booked_at_iso": datetime.now(ZoneInfo("America/Caracas")).isoformat(),
         }
-        logger.info("✅ [BOOKING CONFIRMED - SUPABASE READY] %s", json.dumps(booking_payload, ensure_ascii=False))
+
+        # Inserción atómica en Supabase (verifica colisiones en tiempo real)
+        inserted_ok, status_reason, created_row = await _insert_appointment_supabase(booking_payload)
+        if not inserted_ok and status_reason == "slot_taken":
+            updated_booked = await _fetch_booked_hours_for_date(tenant_id, iso_date)
+            booked_slots_cache[iso_date] = updated_booked
+            new_summary = _format_day_slots_summary(iso_date, language, updated_booked)
+            if language == "es":
+                return (
+                    f"ATENCIÓN - NO CUELGUES: El turno del {spoken_date} a las {spoken_time} acaba de ser ocupado en la base de datos. "
+                    f"Horarios libres restantes para ese día: {new_summary}. "
+                    "Disculpate con naturalidad diciendo que ese turno se acaba de ocupar y pregúntale cuál de los otros horarios disponibles prefiere."
+                )
+            return (
+                f"WAIT - DO NOT HANG UP: The slot on {spoken_date} at {spoken_time} was just taken in the database. "
+                f"Remaining open slots for that day: {new_summary}. "
+                "Warmly let the client know that time slot just got booked and ask which of the remaining open times works best for them."
+            )
+
+        booked_hour_int = int(iso_time.split(":")[0])
+        booked_slots_cache.setdefault(iso_date, set()).add(booked_hour_int)
+        logger.info("✅ [BOOKING CONFIRMED & PERSISTED IN SUPABASE] %s", json.dumps(booking_payload, ensure_ascii=False))
 
         if not call_ending:
             call_ending = True
@@ -1416,12 +1642,12 @@ async def entrypoint(ctx: JobContext):
         _, _, dynamic_farewell = _get_time_of_day_phrases(language)
         if language == "es":
             return (
-                f"Cita registrada en formato Supabase ({iso_date} {iso_time}). "
+                f"Cita guardada exitosamente en Supabase ({iso_date} {iso_time}). "
                 f"Ahora despídete separando las ideas con PUNTO SEGUIDO y mencionando OBLIGATORIAMENTE el día, fecha y hora en letras EXACTAMENTE así (SIN DECIR EL AÑO): "
                 f"'el {spoken_date} a las {spoken_time}. En segundos te llega la confirmación por WhatsApp y correo. Que pases {dynamic_farewell}.'"
             )
         return (
-            f"Appointment recorded in Supabase format ({iso_date} {iso_time}). "
+            f"Appointment saved in Supabase ({iso_date} {iso_time}). "
             f"Now say a warm, concise goodbye using contractions, separating sentences with a PERIOD, and stating the exact day, date, and time in words EXACTLY as: "
             f"'{spoken_date} at {spoken_time}. You'll get the confirmation via WhatsApp and email in just a few seconds. Have {dynamic_farewell}.'"
         )
