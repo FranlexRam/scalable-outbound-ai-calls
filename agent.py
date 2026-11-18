@@ -52,6 +52,15 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 AGENT_NAME = "outbound-agent"
 SIP_TRUNK_ID = os.environ.get("LIVEKIT_SIP_TRUNK_ID", "")
 DEFAULT_TENANT_ID = os.environ.get("SPA_TENANT_ID", "zen_spa")
+DEFAULT_BUSINESS_NAME = os.environ.get("SPA_BUSINESS_NAME", "Zen Spa")
+DEFAULT_SERVICE_NAME = os.environ.get("SPA_SERVICE_NAME", "Valoración Diagnóstica Láser (50% OFF)")
+DEFAULT_BUSINESS_ADDRESS = os.environ.get(
+    "SPA_ADDRESS",
+    "Av. Principal, Centro Comercial Torre Zen, Piso 2, Local 24",
+)
+DEFAULT_FROM_EMAIL = os.environ.get("RESEND_FROM_EMAIL", "Zen Spa <contact@plexuscode.com>")
+DEFAULT_REPLY_TO_EMAIL = os.environ.get("SPA_REPLY_TO_EMAIL", "")
+DEFAULT_ADMIN_EMAIL = os.environ.get("SPA_ADMIN_EMAIL", "")
 # Horario corrido de 9:00 AM a 5:00 PM (incluyendo 12:00 PM mediodía, 1:00 PM y 2:00 PM)
 DEFAULT_MORNING_HOURS = (9, 10, 11)
 DEFAULT_AFTERNOON_HOURS = (12, 13, 14, 15, 16, 17)
@@ -67,12 +76,12 @@ _SHARED_SUPABASE_CLIENT: httpx.AsyncClient | None = None
 
 
 def _get_supabase_http_client() -> httpx.AsyncClient:
-    """Devuelve un cliente HTTP persistente (Keep-Alive TLS) para eliminar ~600ms de handshake en cada operación con Supabase."""
+    """Devuelve un cliente HTTP persistente (Keep-Alive TLS) para eliminar ~600ms de handshake en cada operación con Supabase y Resend."""
     global _SHARED_SUPABASE_CLIENT
     if _SHARED_SUPABASE_CLIENT is None or _SHARED_SUPABASE_CLIENT.is_closed:
         _SHARED_SUPABASE_CLIENT = httpx.AsyncClient(
-            timeout=3.5,
-            limits=httpx.Limits(max_keepalive_connections=5, max_connections=10, keepalive_expiry=120.0),
+            timeout=4.0,
+            limits=httpx.Limits(max_keepalive_connections=8, max_connections=16, keepalive_expiry=120.0),
         )
     return _SHARED_SUPABASE_CLIENT
 
@@ -432,7 +441,7 @@ async def _insert_appointment_supabase(payload: dict) -> tuple[bool, str, dict |
         "client_name": payload["client_name"],
         "whatsapp_number": payload["whatsapp_number"],
         "email": payload["email"],
-        "service_name": payload.get("service_name", "Valoración Diagnóstica Láser (50% OFF)"),
+        "service_name": payload.get("service_name", DEFAULT_SERVICE_NAME),
         "appointment_date": payload["appointment_date"],
         "appointment_time": payload["appointment_time"],
         "appointment_at_iso": payload["appointment_at_iso"],
@@ -467,6 +476,184 @@ async def _insert_appointment_supabase(payload: dict) -> tuple[bool, str, dict |
     except Exception as exc:
         logger.error("❌ [SUPABASE INSERT EXCEPTION] %s", exc)
         return False, str(exc), None
+
+
+async def _send_resend_email(
+    api_key: str,
+    from_email: str,
+    to_email: str,
+    subject: str,
+    html_body: str,
+    reply_to: str = "",
+    tag_label: str = "EMAIL",
+) -> bool:
+    """Envía un correo transaccional vía Resend REST API reutilizando el socket HTTP Keep-Alive."""
+    payload: dict = {
+        "from": from_email,
+        "to": [to_email],
+        "subject": subject,
+        "html": html_body,
+    }
+    if reply_to:
+        payload["reply_to"] = reply_to
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    try:
+        client = _get_supabase_http_client()
+        resp = await client.post("https://api.resend.com/emails", headers=headers, json=payload)
+        if resp.status_code in (200, 201):
+            data = resp.json()
+            logger.info(
+                "📧 [RESEND %s SUCCESS] id='%s' -> to='%s' | subject='%s'",
+                tag_label,
+                data.get("id", "ok"),
+                to_email,
+                subject,
+            )
+            return True
+        logger.warning(
+            "⚠️ [RESEND %s ERROR] HTTP %d sending to '%s': %s",
+            tag_label,
+            resp.status_code,
+            to_email,
+            resp.text[:250],
+        )
+        return False
+    except Exception as exc:
+        logger.error("❌ [RESEND %s EXCEPTION] to='%s': %s", tag_label, to_email, exc)
+        return False
+
+
+async def _dispatch_bilateral_email_notifications(booking_payload: dict) -> None:
+    """Dispara en paralelo (0ms bloqueo de voz) el correo de confirmación al Cliente y la alerta operativa al Spa."""
+    resend_key = os.environ.get("RESEND_API_KEY", "").strip().strip("'\"")
+    if not resend_key:
+        logger.warning("⚠️ [RESEND SKIPPED] RESEND_API_KEY not found in .env — skipping email notifications.")
+        return
+
+    lang = booking_payload.get("language", "es")
+    business_name = booking_payload.get("business_name") or DEFAULT_BUSINESS_NAME
+    service_name = booking_payload.get("service_name") or DEFAULT_SERVICE_NAME
+    business_address = booking_payload.get("business_address") or DEFAULT_BUSINESS_ADDRESS
+    from_email = booking_payload.get("from_email") or os.environ.get("RESEND_FROM_EMAIL", DEFAULT_FROM_EMAIL).strip().strip("'\"")
+    reply_to = booking_payload.get("reply_to_email") or os.environ.get("SPA_REPLY_TO_EMAIL", DEFAULT_REPLY_TO_EMAIL).strip().strip("'\"")
+    admin_email = booking_payload.get("admin_email") or os.environ.get("SPA_ADMIN_EMAIL", DEFAULT_ADMIN_EMAIL).strip().strip("'\"")
+
+    if "<" not in from_email and "@" in from_email:
+        from_email = f"{business_name} <{from_email}>"
+
+    client_name = booking_payload.get("client_name", "Cliente")
+    client_email = booking_payload.get("email", "").strip()
+    whatsapp_num = booking_payload.get("whatsapp_number", "")
+    wa_clean_link = re.sub(r"\D", "", whatsapp_num)
+    display_dt = booking_payload.get("appointment_display", "")
+    iso_date = booking_payload.get("appointment_date", "")
+    iso_time = booking_payload.get("appointment_time", "")
+    appointment_id = booking_payload.get("appointment_id", "N/A")
+    direction_label = "Llamada Saliente IA" if booking_payload.get("call_direction") == "outbound" else "Llamada Entrante IA"
+
+    tasks = []
+
+    # 1. Correo de Confirmación para el Cliente (ES / EN)
+    if client_email and "@" in client_email:
+        if lang == "es":
+            client_subject = f"✅ Cita Confirmada en {business_name} — {display_dt}"
+            client_html = f"""
+            <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 560px; margin: 0 auto; padding: 28px; border: 1px solid #e5e7eb; border-radius: 14px; background-color: #ffffff; color: #111827;">
+                <h2 style="margin-top: 0; color: #0f766e;">¡Hola, {client_name}! Tu cita está confirmada</h2>
+                <p style="font-size: 15px; line-height: 1.6; color: #374151;">
+                    Te esperamos en <strong>{business_name}</strong>. Aquí tienes los detalles de tu reserva:
+                </p>
+                <div style="background-color: #f0fdfa; border-left: 4px solid #0d9488; padding: 16px; border-radius: 8px; margin: 20px 0;">
+                    <p style="margin: 6px 0;"><strong>✨ Servicio:</strong> {service_name}</p>
+                    <p style="margin: 6px 0;"><strong>📅 Fecha y Hora:</strong> {display_dt.capitalize()} ({iso_date} · {iso_time[:5]})</p>
+                    <p style="margin: 6px 0;"><strong>📍 Dirección:</strong> {business_address}</p>
+                    <p style="margin: 6px 0;"><strong>📱 WhatsApp registrado:</strong> {whatsapp_num}</p>
+                </div>
+                <p style="font-size: 14px; line-height: 1.5; color: #4b5563;">
+                    🔔 <strong>Recordatorio automático:</strong> Te enviaremos un mensaje por WhatsApp 24 horas antes de tu cita para confirmar tu asistencia o ayudarte si necesitas reagendar.
+                </p>
+                <hr style="border: none; border-top: 1px solid #e5e7eb; margin: 24px 0;" />
+                <p style="font-size: 12px; color: #9ca3af; margin-bottom: 0;">
+                    Enviado automáticamente por el Asistente Inteligente de {business_name} · Powered by Plexus Code
+                </p>
+            </div>
+            """
+        else:
+            client_subject = f"✅ Appointment Confirmed at {business_name} — {display_dt}"
+            client_html = f"""
+            <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 560px; margin: 0 auto; padding: 28px; border: 1px solid #e5e7eb; border-radius: 14px; background-color: #ffffff; color: #111827;">
+                <h2 style="margin-top: 0; color: #0f766e;">Hi {client_name}, your appointment is confirmed!</h2>
+                <p style="font-size: 15px; line-height: 1.6; color: #374151;">
+                    We look forward to seeing you at <strong>{business_name}</strong>. Here are your booking details:
+                </p>
+                <div style="background-color: #f0fdfa; border-left: 4px solid #0d9488; padding: 16px; border-radius: 8px; margin: 20px 0;">
+                    <p style="margin: 6px 0;"><strong>✨ Service:</strong> {service_name}</p>
+                    <p style="margin: 6px 0;"><strong>📅 Date & Time:</strong> {display_dt} ({iso_date} · {iso_time[:5]})</p>
+                    <p style="margin: 6px 0;"><strong>📍 Location:</strong> {business_address}</p>
+                    <p style="margin: 6px 0;"><strong>📱 Registered WhatsApp:</strong> {whatsapp_num}</p>
+                </div>
+                <p style="font-size: 14px; line-height: 1.5; color: #4b5563;">
+                    🔔 <strong>Automated Reminder:</strong> We'll send you a WhatsApp message 24 hours before your appointment so you can easily confirm or reschedule if needed.
+                </p>
+                <hr style="border: none; border-top: 1px solid #e5e7eb; margin: 24px 0;" />
+                <p style="font-size: 12px; color: #9ca3af; margin-bottom: 0;">
+                    Sent automatically by {business_name} AI Concierge · Powered by Plexus Code
+                </p>
+            </div>
+            """
+        tasks.append(
+            _send_resend_email(
+                api_key=resend_key,
+                from_email=from_email,
+                to_email=client_email,
+                subject=client_subject,
+                html_body=client_html,
+                reply_to=reply_to or admin_email,
+                tag_label="CLIENT_CONFIRMATION",
+            )
+        )
+
+    # 2. Correo Operativo Interno para la Recepción / Dueño del Spa
+    if admin_email and "@" in admin_email:
+        admin_subject = f"🔔 Nueva Cita Agendada por IA: {client_name} ({display_dt})"
+        admin_html = f"""
+        <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 580px; margin: 0 auto; padding: 26px; border: 1px solid #cbd5e1; border-radius: 14px; background-color: #f8fafc; color: #0f172a;">
+            <h2 style="margin-top: 0; color: #1e293b;">🔔 Nueva Cita Registrada en {business_name}</h2>
+            <p style="font-size: 14px; color: #475569;">
+                El agente de voz IA ha verificado y registrado una nueva cita directamente en Supabase:
+            </p>
+            <div style="background-color: #ffffff; border: 1px solid #e2e8f0; padding: 16px; border-radius: 10px; margin: 16px 0;">
+                <p style="margin: 6px 0;"><strong>👤 Cliente:</strong> {client_name}</p>
+                <p style="margin: 6px 0;"><strong>📅 Fecha y Hora:</strong> {display_dt.capitalize()} (<code>{iso_date} {iso_time[:5]}</code>)</p>
+                <p style="margin: 6px 0;"><strong>✨ Servicio:</strong> {service_name}</p>
+                <p style="margin: 6px 0;"><strong>📱 WhatsApp:</strong> <a href="https://wa.me/{wa_clean_link}" style="color: #0284c7; text-decoration: none;">{whatsapp_num}</a></p>
+                <p style="margin: 6px 0;"><strong>✉️ Correo:</strong> <a href="mailto:{client_email}" style="color: #0284c7; text-decoration: none;">{client_email}</a></p>
+                <p style="margin: 6px 0;"><strong>📞 Canal:</strong> {direction_label} (Idioma: {lang.upper()})</p>
+                <p style="margin: 6px 0;"><strong>🆔 Supabase ID:</strong> <code>{appointment_id}</code></p>
+            </div>
+            <p style="font-size: 12px; color: #64748b; margin-bottom: 0;">
+                Notificación Operativa en Tiempo Real · Plexus Code AI Voice Engine
+            </p>
+        </div>
+        """
+        tasks.append(
+            _send_resend_email(
+                api_key=resend_key,
+                from_email=from_email,
+                to_email=admin_email,
+                subject=admin_subject,
+                html_body=admin_html,
+                reply_to=client_email,
+                tag_label="SPA_ADMIN_ALERT",
+            )
+        )
+
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def _format_to_e164_ve(raw_input: str) -> str:
@@ -1159,8 +1346,9 @@ async def _terminate_call_session(
     session: AgentSession,
     initial_wait: float = 1.2,
     max_wait: float = 18.0,
+    pending_tasks: list[asyncio.Task] | None = None,
 ) -> None:
-    """Monitorea en tiempo real el fin de la locución de despedida y corta la llamada sin cortar sílabas ni dejar silencios muertos."""
+    """Monitorea en tiempo real el fin de la locución de despedida, asegura el envío de notificaciones en curso y corta la llamada."""
     try:
         session.input.set_audio_enabled(False)
     except Exception:
@@ -1184,6 +1372,14 @@ async def _terminate_call_session(
             continue
         except Exception:
             break
+
+    if pending_tasks:
+        active_tasks = [t for t in pending_tasks if not t.done()]
+        if active_tasks:
+            try:
+                await asyncio.wait_for(asyncio.gather(*active_tasks, return_exceptions=True), timeout=4.0)
+            except Exception:
+                pass
 
     # Pausa natural breve tras la última sílaba antes de colgar
     await asyncio.sleep(0.7)
@@ -1222,6 +1418,13 @@ async def entrypoint(ctx: JobContext):
             logger.warning("Could not parse job metadata as JSON")
 
     tenant_id: str = metadata.get("tenant_id") or os.environ.get("SPA_TENANT_ID", DEFAULT_TENANT_ID)
+    business_name: str = metadata.get("business_name") or os.environ.get("SPA_BUSINESS_NAME", DEFAULT_BUSINESS_NAME)
+    service_name: str = metadata.get("service_name") or os.environ.get("SPA_SERVICE_NAME", DEFAULT_SERVICE_NAME)
+    business_address: str = metadata.get("business_address") or os.environ.get("SPA_ADDRESS", DEFAULT_BUSINESS_ADDRESS)
+    from_email: str = metadata.get("from_email") or os.environ.get("RESEND_FROM_EMAIL", DEFAULT_FROM_EMAIL)
+    reply_to_email: str = metadata.get("reply_to_email") or os.environ.get("SPA_REPLY_TO_EMAIL", DEFAULT_REPLY_TO_EMAIL)
+    admin_email: str = metadata.get("admin_email") or os.environ.get("SPA_ADMIN_EMAIL", DEFAULT_ADMIN_EMAIL)
+
     phone_number: str = (
         metadata.get("phone_number")
         or os.environ.get("DEFAULT_CLIENT_PHONE", "+584241226796")
@@ -1229,13 +1432,13 @@ async def entrypoint(ctx: JobContext):
     language: str = metadata.get("language") or os.environ.get("AGENT_LANGUAGE", "es")
     default_instructions = (
         (
-            "Representas a Zen Spa. El objetivo es invitar al cliente a aprovechar su cincuenta por ciento de descuento "
+            f"Representas a {business_name}. El objetivo es invitar al cliente a aprovechar su cincuenta por ciento de descuento "
             "en paquetes de depilación láser definitiva y agendarle una sesión de valoración diagnóstica gratuita de quince minutos "
             "con nuestra especialista para evaluar su piel sin compromiso."
         )
         if language == "es"
         else (
-            "You represent Zen Spa. Your goal is to invite the client to use their pre-approved fifty percent discount "
+            f"You represent {business_name}. Your goal is to invite the client to use their pre-approved fifty percent discount "
             "on laser hair removal packages and schedule a free fifteen-minute diagnostic skin assessment with our specialist "
             "with no obligation."
         )
@@ -1266,9 +1469,9 @@ async def entrypoint(ctx: JobContext):
     )
     contact_name: str = metadata.get("contact_name", "Franlex")
     default_context = (
-        "Cliente frecuente y leal de Zen Spa. Tiene pre-aprobado un cincuenta por ciento de descuento en depilación láser definitiva y valoración inicial sin costo."
+        f"Cliente frecuente y leal de {business_name}. Tiene pre-aprobado un cincuenta por ciento de descuento en depilación láser definitiva y valoración inicial sin costo."
         if language == "es"
-        else "Frequent and loyal client at Zen Spa. Pre-approved for a fifty percent discount on laser hair removal and a free initial diagnostic assessment."
+        else f"Frequent and loyal client at {business_name}. Pre-approved for a fifty percent discount on laser hair removal and a free initial diagnostic assessment."
     )
     personalization_context: str = metadata.get("personalization_context") or default_context
     custom_business_hours: str = (
@@ -1297,6 +1500,8 @@ async def entrypoint(ctx: JobContext):
             "<runtime_data>\n"
             f"  <temporal_awareness>{temporal_context}</temporal_awareness>\n"
             "  <business_and_client_context>\n"
+            f"    <business_name>{business_name}</business_name>\n"
+            f"    <business_address>{business_address}</business_address>\n"
             f"    <client_name>{client_label}</client_name>\n"
             f"    <client_phone>{phone_number or 'este mismo número'}</client_phone>\n"
             f"    <call_context>{raw_call_context}</call_context>\n"
@@ -1305,12 +1510,12 @@ async def entrypoint(ctx: JobContext):
             "</runtime_data>\n\n"
             "<agent_system_manifest>\n"
             "  <identity>\n"
-            f"    Eres {agent_display_name}, especialista de atención al cliente en llamadas salientes. "
+            f"    Eres {agent_display_name}, especialista de atención al cliente en llamadas salientes de {business_name}. "
             "Asumes siempre que el cliente está ocupado haciendo otras cosas: tu ritmo es ágil, cercano, empático y ejecutivo. Hablas siempre en español neutro usando 'tú' (PROHIBIDO usar voseo argentino como 'usás', 'tenés' o 'podés'; di siempre 'usas', 'tienes', 'puedes') y JAMÁS uses términos en inglés como 'Senior Client Success Manager'. No recites plantillas de memoria; responde con naturalidad genuina.\n"
             "  </identity>\n\n"
             "  <execution_pipeline>\n"
             "    <phase index=\"1\" name=\"turno_1_presentacion_con_nombre_y_gancho_corto\">\n"
-            f"      En cuanto el cliente confirme que es él después del 'Aló', salúdalo por su nombre y preséntate con tu nombre ({agent_display_name}) y la empresa, pon un PUNTO SEGUIDO, di el beneficio principal según <business_instructions> y cierra con un PUNTO SEGUIDO antes de la pregunta de permiso (máximo 25 palabras; ej. 'Hola, {client_label}, te habla {agent_display_name} de Zen Spa. Te llamo porque tienes aprobado un cincuenta por ciento de descuento en depilación láser por ser cliente frecuente. ¿Tienes treinta segundos?').\n"
+            f"      En cuanto el cliente confirme que es él después del 'Aló', salúdalo por su nombre y preséntate con tu nombre ({agent_display_name}) y la empresa ({business_name}), pon un PUNTO SEGUIDO, di el beneficio principal según <business_instructions> y cierra con un PUNTO SEGUIDO antes de la pregunta de permiso (máximo 25 palabras; ej. 'Hola, {client_label}, te habla {agent_display_name} de {business_name}. Te llamo porque tienes aprobado un cincuenta por ciento de descuento en depilación láser por ser cliente frecuente. ¿Tienes treinta segundos?').\n"
             "    </phase>\n"
             "    <phase index=\"2\" name=\"turno_2_el_valor_y_validacion_de_interes\">\n"
             "      Cuando el cliente diga 'Sí, dime', 'Sí, ok' o pregunte '¿De qué trata?', NO pidas fechas todavía. Abre con una muletilla natural unida con coma ('Pues mira, te incluimos...', 'Ah, mira, se trata de...'), explica brevemente la valoración sin compromiso según <business_instructions>, pon un PUNTO SEGUIDO y haz una pregunta corta para validar si le interesa aprovecharla.\n"
@@ -1355,6 +1560,8 @@ async def entrypoint(ctx: JobContext):
             "<runtime_data>\n"
             f"  <temporal_awareness>{temporal_context}</temporal_awareness>\n"
             "  <business_and_client_context>\n"
+            f"    <business_name>{business_name}</business_name>\n"
+            f"    <business_address>{business_address}</business_address>\n"
             f"    <client_name>{client_label}</client_name>\n"
             f"    <client_phone>{phone_number or 'this same number'}</client_phone>\n"
             f"    <call_context>{raw_call_context}</call_context>\n"
@@ -1363,12 +1570,12 @@ async def entrypoint(ctx: JobContext):
             "</runtime_data>\n\n"
             "<agent_system_manifest>\n"
             "  <identity>\n"
-            f"    You are {agent_display_name}, a warm, personable client success specialist making an outbound call. "
+            f"    You are {agent_display_name}, a warm, personable client success specialist making an outbound call for {business_name}. "
             "Assume the prospect is busy: keep your tone natural, relaxed, friendly, and conversational. ALWAYS use natural spoken English contractions ('I'm', 'we're', 'there's', 'you'll', 'I'll', 'it's', 'don't', 'that's') — NEVER speak in stiff, uncontracted robotic sentences like 'I am calling' or 'There is no obligation'. Never recite memorized templates.\n"
             "  </identity>\n\n"
             "  <execution_pipeline>\n"
             "    <phase index=\"1\" name=\"turn_1_name_intro_and_short_hook\">\n"
-            f"      As soon as the prospect confirms it is them after 'Hello?', greet them warmly by name and introduce yourself ({agent_display_name}) and the company, put a PERIOD, state their main benefit from <business_instructions> using natural contractions, put a PERIOD, and end with a quick permission question (max 25 words; e.g., 'Hi, {client_label}, this is {agent_display_name} from Zen Spa. I'm calling because you've got a pre-approved fifty percent discount on laser hair removal as a frequent client. Do you have thirty seconds?').\n"
+            f"      As soon as the prospect confirms it is them after 'Hello?', greet them warmly by name and introduce yourself ({agent_display_name}) and the company ({business_name}), put a PERIOD, state their main benefit from <business_instructions> using natural contractions, put a PERIOD, and end with a quick permission question (max 25 words; e.g., 'Hi, {client_label}, this is {agent_display_name} from {business_name}. I'm calling because you've got a pre-approved fifty percent discount on laser hair removal as a frequent client. Do you have thirty seconds?').\n"
             "    </phase>\n"
             "    <phase index=\"2\" name=\"turn_2_value_and_interest_check\">\n"
             "      When the prospect says 'Sure / Go ahead' or asks 'What is this about?', DO NOT ask for dates yet. Open with a natural conversational transition ('So basically, we're including...', 'Well, we're offering...'), briefly explain the free assessment from <business_instructions>, put a PERIOD, and ask if they'd like to try it.\n"
@@ -1410,8 +1617,8 @@ async def entrypoint(ctx: JobContext):
         )
 
     logger.info(
-        "Starting call as '%s' (voice=%s, language=%s, tenant=%s)",
-        agent_display_name, voice_id or DEFAULT_TTS_MODEL, language, tenant_id,
+        "Starting call as '%s' (voice=%s, language=%s, tenant=%s, business='%s')",
+        agent_display_name, voice_id or DEFAULT_TTS_MODEL, language, tenant_id, business_name,
     )
 
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
@@ -1456,6 +1663,7 @@ async def entrypoint(ctx: JobContext):
         )
 
     call_ending = False
+    pending_notification_tasks: list[asyncio.Task] = []
     booking_state: dict = {
         "last_user_text": "",
         "needs_readback_confirmation": False,
@@ -1651,6 +1859,12 @@ async def entrypoint(ctx: JobContext):
 
         booking_payload = {
             "tenant_id": tenant_id,
+            "business_name": business_name,
+            "service_name": service_name,
+            "business_address": business_address,
+            "from_email": from_email,
+            "reply_to_email": reply_to_email,
+            "admin_email": admin_email,
             "client_name": contact_name or ("Cliente" if language == "es" else "Prospect"),
             "appointment_date": iso_date,
             "appointment_time": iso_time,
@@ -1685,15 +1899,30 @@ async def entrypoint(ctx: JobContext):
                 "Warmly let the client know that time slot just got booked and ask which of the remaining open times works best for them."
             )
 
+        if isinstance(created_row, dict) and created_row.get("id"):
+            booking_payload["appointment_id"] = created_row["id"]
+
         booking_state["db_inserted"] = True
         booked_hour_int = int(iso_time.split(":")[0])
         booked_slots_cache.setdefault(iso_date, set()).add(booked_hour_int)
         logger.info("✅ [BOOKING CONFIRMED & PERSISTED IN SUPABASE] %s", json.dumps(booking_payload, ensure_ascii=False))
 
+        # Disparo asíncrono en segundo plano de los correos bilaterales (Cliente + Spa) con 0ms de impacto en voz
+        notif_task = asyncio.create_task(_dispatch_bilateral_email_notifications(booking_payload))
+        pending_notification_tasks.append(notif_task)
+
         if not call_ending:
             call_ending = True
             logger.info("📴 Booking completed — waiting for full confirmation & goodbye audio before hanging up…")
-            asyncio.create_task(_terminate_call_session(ctx, session, initial_wait=2.5, max_wait=18.0))
+            asyncio.create_task(
+                _terminate_call_session(
+                    ctx,
+                    session,
+                    initial_wait=2.5,
+                    max_wait=18.0,
+                    pending_tasks=pending_notification_tasks,
+                )
+            )
 
         _, _, dynamic_farewell = _get_time_of_day_phrases(language)
         if language == "es":
