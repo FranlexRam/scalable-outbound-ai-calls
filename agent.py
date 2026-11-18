@@ -292,6 +292,26 @@ def _format_hour_spoken(hour_24: int, language: str) -> str:
     return f"{HOURS_EN_WORDS[hour_24 - 12]} in the afternoon"
 
 
+def _format_written_datetime(iso_date: str, iso_time: str, language: str) -> str:
+    """Formatea fecha y hora en estilo ejecutivo limpio para correos y paneles (ej. 'Viernes, 27 de noviembre de 2026 · 03:00 PM')."""
+    try:
+        dt = datetime.strptime(f"{iso_date} {iso_time[:5]}", "%Y-%m-%d %H:%M")
+        hour_24 = dt.hour
+        minute_val = dt.minute
+        period_ampm = "AM" if hour_24 < 12 else "PM"
+        hour_12 = hour_24 % 12 or 12
+        time_12h_str = f"{hour_12:02d}:{minute_val:02d} {period_ampm}"
+        if language == "es":
+            day_name = DAYS_ES[dt.weekday()].capitalize()
+            month_name = MONTHS_ES[dt.month - 1]
+            return f"{day_name}, {dt.day} de {month_name} de {dt.year} · {time_12h_str}"
+        day_name_en = DAYS_EN[dt.weekday()]
+        month_name_en = dt.strftime("%B")
+        return f"{day_name_en}, {month_name_en} {dt.day}, {dt.year} · {time_12h_str}"
+    except Exception:
+        return f"{iso_date} · {iso_time[:5]}"
+
+
 def _get_supabase_credentials() -> tuple[str, str]:
     """Obtiene y sanea URL y API Key de Supabase desde las variables de entorno."""
     sb_url = (
@@ -377,46 +397,24 @@ async def _fetch_booked_hours_for_date(tenant_id: str, iso_date: str) -> set[int
 
 
 def _format_day_slots_summary(iso_date: str, language: str, booked_hours: set[int]) -> str:
-    """Genera el resumen detallado de horas libres y ocupadas (de 9:00 AM a 5:00 PM corrido) para una fecha."""
-    free_morning = [h for h in DEFAULT_MORNING_HOURS if h not in booked_hours]
-    free_afternoon = [h for h in DEFAULT_AFTERNOON_HOURS if h not in booked_hours]
+    """Genera el resumen conciso y aislado por fecha de horas ocupadas y libres en Supabase."""
+    all_hours = DEFAULT_MORNING_HOURS + DEFAULT_AFTERNOON_HOURS
+    free_all = [h for h in all_hours if h not in booked_hours]
 
     if language == "es":
-        m_words = [_format_hour_spoken(h, "es") for h in free_morning]
-        a_words = [_format_hour_spoken(h, "es") for h in free_afternoon]
+        if not booked_hours:
+            return "TODO LIBRE de nueve de la mañana a cinco de la tarde"
+        if not free_all:
+            return f"SIN CUPOS DISPONIBLES EL {iso_date} (día lleno)"
         booked_words = [_format_hour_spoken(h, "es") for h in sorted(booked_hours)]
-        if not free_morning and not free_afternoon:
-            return "SIN CUPOS DISPONIBLES (día completamente lleno)"
-        parts = []
-        if m_words:
-            parts.append(f"mañana libre: {', '.join(m_words)}")
-        else:
-            parts.append("mañana: lleno")
-        if a_words:
-            parts.append(f"mediodía/tarde libre: {', '.join(a_words)}")
-        else:
-            parts.append("mediodía/tarde: lleno")
-        if booked_words:
-            parts.append(f"OCUPADOS EN DB: {', '.join(booked_words)}")
-        return " | ".join(parts)
+        return f"OCUPADO SOLO EL {iso_date}: {', '.join(booked_words)} | TODAS LAS DEMÁS HORAS DE 9AM A 5PM ESTÁN LIBRES"
 
-    m_words_en = [_format_hour_spoken(h, "en") for h in free_morning]
-    a_words_en = [_format_hour_spoken(h, "en") for h in free_afternoon]
+    if not booked_hours:
+        return "ALL SLOTS OPEN from nine AM to five PM"
+    if not free_all:
+        return f"FULLY BOOKED ON {iso_date} (no open slots)"
     booked_words_en = [_format_hour_spoken(h, "en") for h in sorted(booked_hours)]
-    if not free_morning and not free_afternoon:
-        return "FULLY BOOKED (no open slots)"
-    parts_en = []
-    if m_words_en:
-        parts_en.append(f"morning open: {', '.join(m_words_en)}")
-    else:
-        parts_en.append("morning: full")
-    if a_words_en:
-        parts_en.append(f"noon/afternoon open: {', '.join(a_words_en)}")
-    else:
-        parts_en.append("noon/afternoon: full")
-    if booked_words_en:
-        parts_en.append(f"ALREADY BOOKED IN DB: {', '.join(booked_words_en)}")
-    return " | ".join(parts_en)
+    return f"BOOKED ONLY ON {iso_date}: {', '.join(booked_words_en)} | ALL OTHER HOURS 9AM TO 5PM ARE OPEN"
 
 
 async def _insert_appointment_supabase(payload: dict) -> tuple[bool, str, dict | None]:
@@ -528,7 +526,7 @@ async def _send_resend_email(
 
 
 async def _dispatch_bilateral_email_notifications(booking_payload: dict) -> None:
-    """Dispara en paralelo (0ms bloqueo de voz) el correo de confirmación al Cliente y la alerta operativa al Spa."""
+    """Dispara en paralelo (0ms bloqueo de voz) el correo de confirmación al Cliente y la alerta operativa al Spa con fecha/hora ejecutiva."""
     resend_key = os.environ.get("RESEND_API_KEY", "").strip().strip("'\"")
     if not resend_key:
         logger.warning("⚠️ [RESEND SKIPPED] RESEND_API_KEY not found in .env — skipping email notifications.")
@@ -549,18 +547,19 @@ async def _dispatch_bilateral_email_notifications(booking_payload: dict) -> None
     client_email = booking_payload.get("email", "").strip()
     whatsapp_num = booking_payload.get("whatsapp_number", "")
     wa_clean_link = re.sub(r"\D", "", whatsapp_num)
-    display_dt = booking_payload.get("appointment_display", "")
     iso_date = booking_payload.get("appointment_date", "")
     iso_time = booking_payload.get("appointment_time", "")
+    written_dt = booking_payload.get("appointment_written") or _format_written_datetime(iso_date, iso_time, lang)
+    written_dt_es = _format_written_datetime(iso_date, iso_time, "es")
     appointment_id = booking_payload.get("appointment_id", "N/A")
     direction_label = "Llamada Saliente IA" if booking_payload.get("call_direction") == "outbound" else "Llamada Entrante IA"
 
     tasks = []
 
-    # 1. Correo de Confirmación para el Cliente (ES / EN)
+    # 1. Correo de Confirmación para el Cliente (ES / EN) con Fecha y Hora en formato ejecutivo
     if client_email and "@" in client_email:
         if lang == "es":
-            client_subject = f"✅ Cita Confirmada en {business_name} — {display_dt}"
+            client_subject = f"✅ Cita Confirmada en {business_name} — {written_dt}"
             client_html = f"""
             <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 560px; margin: 0 auto; padding: 28px; border: 1px solid #e5e7eb; border-radius: 14px; background-color: #ffffff; color: #111827;">
                 <h2 style="margin-top: 0; color: #0f766e;">¡Hola, {client_name}! Tu cita está confirmada</h2>
@@ -569,7 +568,7 @@ async def _dispatch_bilateral_email_notifications(booking_payload: dict) -> None
                 </p>
                 <div style="background-color: #f0fdfa; border-left: 4px solid #0d9488; padding: 16px; border-radius: 8px; margin: 20px 0;">
                     <p style="margin: 6px 0;"><strong>✨ Servicio:</strong> {service_name}</p>
-                    <p style="margin: 6px 0;"><strong>📅 Fecha y Hora:</strong> {display_dt.capitalize()} ({iso_date} · {iso_time[:5]})</p>
+                    <p style="margin: 6px 0;"><strong>📅 Fecha y Hora:</strong> {written_dt}</p>
                     <p style="margin: 6px 0;"><strong>📍 Dirección:</strong> {business_address}</p>
                     <p style="margin: 6px 0;"><strong>📱 WhatsApp registrado:</strong> {whatsapp_num}</p>
                 </div>
@@ -583,7 +582,7 @@ async def _dispatch_bilateral_email_notifications(booking_payload: dict) -> None
             </div>
             """
         else:
-            client_subject = f"✅ Appointment Confirmed at {business_name} — {display_dt}"
+            client_subject = f"✅ Appointment Confirmed at {business_name} — {written_dt}"
             client_html = f"""
             <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 560px; margin: 0 auto; padding: 28px; border: 1px solid #e5e7eb; border-radius: 14px; background-color: #ffffff; color: #111827;">
                 <h2 style="margin-top: 0; color: #0f766e;">Hi {client_name}, your appointment is confirmed!</h2>
@@ -592,7 +591,7 @@ async def _dispatch_bilateral_email_notifications(booking_payload: dict) -> None
                 </p>
                 <div style="background-color: #f0fdfa; border-left: 4px solid #0d9488; padding: 16px; border-radius: 8px; margin: 20px 0;">
                     <p style="margin: 6px 0;"><strong>✨ Service:</strong> {service_name}</p>
-                    <p style="margin: 6px 0;"><strong>📅 Date & Time:</strong> {display_dt} ({iso_date} · {iso_time[:5]})</p>
+                    <p style="margin: 6px 0;"><strong>📅 Date & Time:</strong> {written_dt}</p>
                     <p style="margin: 6px 0;"><strong>📍 Location:</strong> {business_address}</p>
                     <p style="margin: 6px 0;"><strong>📱 Registered WhatsApp:</strong> {whatsapp_num}</p>
                 </div>
@@ -619,7 +618,7 @@ async def _dispatch_bilateral_email_notifications(booking_payload: dict) -> None
 
     # 2. Correo Operativo Interno para la Recepción / Dueño del Spa
     if admin_email and "@" in admin_email:
-        admin_subject = f"🔔 Nueva Cita Agendada por IA: {client_name} ({display_dt})"
+        admin_subject = f"🔔 Nueva Cita Agendada por IA: {client_name} ({written_dt_es})"
         admin_html = f"""
         <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 580px; margin: 0 auto; padding: 26px; border: 1px solid #cbd5e1; border-radius: 14px; background-color: #f8fafc; color: #0f172a;">
             <h2 style="margin-top: 0; color: #1e293b;">🔔 Nueva Cita Registrada en {business_name}</h2>
@@ -628,7 +627,7 @@ async def _dispatch_bilateral_email_notifications(booking_payload: dict) -> None
             </p>
             <div style="background-color: #ffffff; border: 1px solid #e2e8f0; padding: 16px; border-radius: 10px; margin: 16px 0;">
                 <p style="margin: 6px 0;"><strong>👤 Cliente:</strong> {client_name}</p>
-                <p style="margin: 6px 0;"><strong>📅 Fecha y Hora:</strong> {display_dt.capitalize()} (<code>{iso_date} {iso_time[:5]}</code>)</p>
+                <p style="margin: 6px 0;"><strong>📅 Fecha y Hora:</strong> {written_dt_es}</p>
                 <p style="margin: 6px 0;"><strong>✨ Servicio:</strong> {service_name}</p>
                 <p style="margin: 6px 0;"><strong>📱 WhatsApp:</strong> <a href="https://wa.me/{wa_clean_link}" style="color: #0284c7; text-decoration: none;">{whatsapp_num}</a></p>
                 <p style="margin: 6px 0;"><strong>✉️ Correo:</strong> <a href="mailto:{client_email}" style="color: #0284c7; text-decoration: none;">{client_email}</a></p>
@@ -956,7 +955,7 @@ def _get_temporal_context(
     custom_schedule: str = "",
     booked_slots_map: dict[str, set[int]] | None = None,
 ) -> str:
-    """Pre-calcula en Python el calendario compacto de 14 días (horario corrido 9 AM a 5 PM) e inyecta las excepciones ocupadas en Supabase."""
+    """Pre-calcula en Python el calendario compacto de 14 días (horario corrido 9 AM a 5 PM) con aislamiento explícito por fecha."""
     now = datetime.now(ZoneInfo("America/Caracas"))
     period, greeting_phrase, farewell_phrase = _get_time_of_day_phrases(language)
     monday_this_week = now - timedelta(days=now.weekday())
@@ -966,6 +965,7 @@ def _get_temporal_context(
 
     this_week_items = []
     next_week_items = []
+    free_tag = "TODO LIBRE 9am-5pm" if language == "es" else "ALL OPEN 9am-5pm"
     for d_idx in range(7):
         dt_this = monday_this_week + timedelta(days=d_idx)
         dt_next = monday_this_week + timedelta(weeks=1, days=d_idx)
@@ -976,48 +976,46 @@ def _get_temporal_context(
             b_this = booked_map.get(iso_this, set())
             if b_this:
                 this_week_items.append(
-                    f"{_format_date_phonetic(dt_this, language)} [ISO: {iso_this} -> {_format_day_slots_summary(iso_this, language, b_this)}]"
+                    f"{_format_date_phonetic(dt_this, language)} ({iso_this}: {_format_day_slots_summary(iso_this, language, b_this)})"
                 )
             else:
-                this_week_items.append(f"{_format_date_phonetic(dt_this, language)} [ISO: {iso_this}]")
+                this_week_items.append(f"{_format_date_phonetic(dt_this, language)} ({iso_this}: {free_tag})")
 
         b_next = booked_map.get(iso_next, set())
         if b_next:
             next_week_items.append(
-                f"{_format_date_phonetic(dt_next, language)} [ISO: {iso_next} -> {_format_day_slots_summary(iso_next, language, b_next)}]"
+                f"{_format_date_phonetic(dt_next, language)} ({iso_next}: {_format_day_slots_summary(iso_next, language, b_next)})"
             )
         else:
-            next_week_items.append(f"{_format_date_phonetic(dt_next, language)} [ISO: {iso_next}]")
+            next_week_items.append(f"{_format_date_phonetic(dt_next, language)} ({iso_next}: {free_tag})")
 
     hour_12 = now.hour % 12 or 12
 
     if language == "es":
         schedule_es = custom_schedule.strip() or (
-            "Horario de atención corrido del negocio: de nueve de la mañana a cinco de la tarde (incluyendo mediodía). "
-            "Cupos disponibles por defecto todos los días (salvo los marcados como OCUPADOS EN DB en una fecha): "
-            "en la mañana nueve, diez y once de la mañana; al mediodía y tarde doce del mediodía, una, dos, tres, cuatro y cinco de la tarde."
+            "Horario de atención corrido del negocio: de nueve de la mañana a cinco de la tarde (nueve, diez y once de la mañana; doce del mediodía; una, dos, tres, cuatro y cinco de la tarde). "
+            "REGLA DE PRECISIÓN POR FECHA: Cada día tiene entre paréntesis su propio estado independiente. Si un día dice 'TODO LIBRE 9am-5pm', TODAS las horas de nueve de la mañana a cinco de la tarde están libres ese día (no confundas una hora ocupada de otro día con el día que pide el cliente)."
         )
         return (
             f"Ahora mismo (HOY) es {_format_date_phonetic(now, 'es')} [ISO: {now.strftime('%Y-%m-%d')}], {hour_12}:{now.minute:02d} {period}. "
             f"MAÑANA es {_format_date_phonetic(tomorrow, 'es')} [ISO: {tomorrow.strftime('%Y-%m-%d')}]. "
             f"PASADO MAÑANA es {_format_date_phonetic(day_after, 'es')} [ISO: {day_after.strftime('%Y-%m-%d')}]. "
-            f"Días restantes de ESTA SEMANA: {'; '.join(this_week_items)}. "
-            f"Días de LA PRÓXIMA SEMANA (semana entrante): {'; '.join(next_week_items)}. "
+            f"Días restantes de ESTA SEMANA: {' || '.join(this_week_items)}. "
+            f"Días de LA PRÓXIMA SEMANA (semana entrante): {' || '.join(next_week_items)}. "
             f"{schedule_es} "
             f"Saludo actual: '{greeting_phrase}'. Despedida actual: 'que pases {farewell_phrase}'."
         )
 
     schedule_en = custom_schedule.strip() or (
-        "Continuous business operating hours: nine in the morning to five in the afternoon (including noon). "
-        "Default open slots every day (unless marked as ALREADY BOOKED IN DB on a specific date): "
-        "in the morning at nine, ten, and eleven in the morning; at noon and afternoon at twelve noon, one, two, three, four, and five in the afternoon."
+        "Continuous business operating hours: nine in the morning to five in the afternoon (nine, ten, and eleven in the morning; twelve noon; one, two, three, four, and five in the afternoon). "
+        "DATE ISOLATION RULE: Each day has its own independent availability in parentheses. If a day says 'ALL OPEN 9am-5pm', EVERY hour from nine AM to five PM is open on that day (never confuse a booked slot on another date with the date the prospect asked for)."
     )
     return (
         f"Right now (TODAY) is {_format_date_phonetic(now, 'en')} [ISO: {now.strftime('%Y-%m-%d')}], {hour_12}:{now.minute:02d} {period}. "
         f"TOMORROW is {_format_date_phonetic(tomorrow, 'en')} [ISO: {tomorrow.strftime('%Y-%m-%d')}]. "
         f"DAY AFTER TOMORROW is {_format_date_phonetic(day_after, 'en')} [ISO: {day_after.strftime('%Y-%m-%d')}]. "
-        f"Remaining days THIS WEEK: {'; '.join(this_week_items)}. "
-        f"Days NEXT WEEK: {'; '.join(next_week_items)}. "
+        f"Remaining days THIS WEEK: {' || '.join(this_week_items)}. "
+        f"Days NEXT WEEK: {' || '.join(next_week_items)}. "
         f"{schedule_en} "
         f"Current greeting: '{greeting_phrase}'. Current farewell: 'have {farewell_phrase}'."
     )
@@ -1524,15 +1522,15 @@ async def entrypoint(ctx: JobContext):
             "      - PASO 3.1 (COMPUERTA ESTRICTA DE CONFIRMACIÓN — PROHIBIDO ASIGNAR HOY O UNA HORA CUANDO EL CLIENTE SOLO DICE 'OK'):\n"
             "        * RAMA A (El cliente expresa duda, temor o 'pero'): SIGNIFICA QUE AÚN NO HA CONFIRMADO. Está PROHIBIDO pedirle días o fechas en este turno. Responde con tus propias palabras ÚNICAMENTE a su duda puntual (valor, gratuidad sin obligación de compra, o comodidad del láser frío sin dolor) sin repetir argumentos previos. Cierra con PUNTO SEGUIDO y pregunta: '¿Te animas a probarlo?'\n"
             "        * RAMA B (El cliente dice 'Ok', 'Bueno, está bien', 'Sí, dale' aceptando probar la valoración, pero AÚN NO HA DICHO QUÉ DÍA QUIERE): Está TERMINANTEMENTE PROHIBIDO inventar o asignarle el día de hoy o las nueve de la mañana por tu cuenta. Cuando el cliente solo dice 'Ok' para aceptar la valoración, pregúntale obligatoriamente: 'Perfecto. ¿Qué día de esta semana o de la próxima te queda bien?'\n"
-            "      - PASO 3.2 (Dar Disponibilidad Real de Supabase en 2 Opciones SIN usar herramientas para esta semana o la próxima): Cuando el cliente mencione un día de esta semana o de la próxima, léelo directamente de <temporal_awareness> (NO invoques check_availability salvo que pida dos o más semanas en el futuro). Abre con una expresión humana natural ('A ver, déjame ver, el sábado...', 'Eeh, ya te digo, para el jueves...', 'Bueno, déjame reviso, un segundito, el miércoles...'), ofrece SOLO DOS opciones iniciales que figuren libres en <temporal_awareness> para ese día (PROHIBIDO ofrecer horas que aparezcan en 'OCUPADOS EN DB'), pon un PUNTO SEGUIDO y cierra con '. ¿Cuál de las dos te queda mejor?'\n"
-            "      - PASO 3.3 (Selección de Hora, Mediodía/Otros Horarios y Horas Ocupadas en DB):\n"
-            "        * SI EL CLIENTE ELIGE UNA HORA (ej. 'A las diez', 'Me gustaría a la una') O PIDE UNA HORA ESPECÍFICA QUE SÍ ESTÁ LIBRE EN <temporal_awareness>: Responde OBLIGATORIAMENTE con la estructura del PASO 4.1: 'Perfecto, entonces sería el [día y fecha sin año] a las [hora en letras]. Te envío la confirmación por WhatsApp y correo. ¿Usas este mismo número para tu WhatsApp?'\n"
-            "        * SI PREGUNTA QUÉ OTROS HORARIOS TIENES EN LA MAÑANA, MEDIODÍA O TARDE: Abre con una expresión natural ('Eh, mira, en la tarde tengo...', 'Pues mira, también me queda...'), menciona MÁXIMO DOS O TRES opciones libres de ese bloque según <temporal_awareness> (no recites seis horas seguidas), pon un PUNTO SEGUIDO y cierra con '¿Cuál te queda mejor?'\n"
-            "        * SI PIDE UNA HORA QUE APARECE EN 'OCUPADOS EN DB' O FUERA DEL HORARIO (antes de las nueve de la mañana o después de las cinco de la tarde): Explícale con naturalidad el motivo exacto, pon un PUNTO SEGUIDO y ofrécele dos horas libres cercanas cerrando con pregunta.\n"
+            "      - PASO 3.2 (Dar Disponibilidad Real de Supabase en 2 Opciones SIN usar herramientas para esta semana o la próxima): Cuando el cliente mencione un día de esta semana o de la próxima, léelo directamente de <temporal_awareness> (NO invoques check_availability salvo que pida dos o más semanas en el futuro). Abre con una expresión humana natural ('A ver, déjame ver, el sábado...', 'Eeh, ya te digo, para el viernes...'), ofrece SOLO DOS opciones iniciales que figuren libres en <temporal_awareness> para esa fecha exacta, pon un PUNTO SEGUIDO y cierra con '. ¿Cuál de las dos te queda mejor?'\n"
+            "      - PASO 3.3 (Selección de Hora, Mediodía/Otros Horarios y Verificación Exacta por Fecha en DB):\n"
+            "        * SI EL CLIENTE ELIGE UNA HORA O PIDE CUALQUIER HORA ENTRE NUEVE DE LA MAÑANA Y CINCO DE LA TARDE (ej. 'A las cuatro', 'Al mediodía', 'A la una'): Revisa en <temporal_awareness> ÚNICAMENTE el paréntesis de ESA fecha exacta. Si esa fecha dice 'TODO LIBRE 9am-5pm' o si esa hora NO está listada en 'OCUPADO SOLO EL [fecha]' de ese mismo día, SIGNIFICA QUE SÍ ESTÁ LIBRE (aunque no la hayas nombrado en tu turno anterior). Acéptala de inmediato y responde con la estructura del PASO 4.1: 'Perfecto, entonces sería el [día y fecha sin año] a las [hora en letras]. Te envío la confirmación por WhatsApp y correo. ¿Usas este mismo número para tu WhatsApp?'\n"
+            "        * SI PREGUNTA QUÉ OTROS HORARIOS TIENES EN LA MAÑANA, MEDIODÍA O TARDE: Abre con una expresión natural ('Eh, mira, en la tarde tengo...', 'Pues mira, también me queda...'), menciona DOS O TRES opciones libres de ese bloque según <temporal_awareness>, pon un PUNTO SEGUIDO y cierra con '¿Cuál te queda mejor?'\n"
+            "        * ÚNICAMENTE SI LA HORA PEDIDA APARECE EXPLÍCITAMENTE EN 'OCUPADO SOLO EL [esa misma fecha]' O ES FUERA DE HORARIO (antes de las nueve o después de las cinco): Explícale el motivo y ofrécele dos horas libres cercanas cerrando con pregunta.\n"
             "    </phase>\n"
             "    <phase index=\"4\" name=\"confirmacion_obligatoria_paso_a_paso_whatsapp_y_correo\">\n"
             "      REGLA CRÍTICA INQUEBRANTABLE: SOLO entra a esta fase cuando el cliente YA haya elegido TANTO el DÍA como la HORA. Haz una sola pregunta corta por turno separando las oraciones con PUNTO SEGUIDO:\n"
-            "      - PASO 4.1 (Confirmar Fecha/Hora Elegida sin Año y Preguntar WhatsApp): Apenas el cliente elija la hora (ej. 'A la una', 'A las once'), di exactamente esta estructura: 'Perfecto, entonces sería el [día y fecha sin año] a las [hora en letras]. Te envío la confirmación por WhatsApp y correo. ¿Usas este mismo número para tu WhatsApp?' (ej. 'Perfecto, entonces sería el sábado veintiocho de noviembre a la una de la tarde. Te envío la confirmación por WhatsApp y correo. ¿Usas este mismo número para tu WhatsApp?').\n"
+            "      - PASO 4.1 (Confirmar Fecha/Hora Elegida sin Año y Preguntar WhatsApp): Apenas el cliente elija la hora (ej. 'A las cuatro', 'A las tres'), di exactamente esta estructura: 'Perfecto, entonces sería el [día y fecha sin año] a las [hora en letras]. Te envío la confirmación por WhatsApp y correo. ¿Usas este mismo número para tu WhatsApp?'\n"
             "      - PASO 4.2 (Rama Sí / Rama No y Verificación en Bucle del WhatsApp con Pausas):\n"
             "        * Si confirma que usa ese mismo número: pídele su correo electrónico ('Listo, ¿a qué correo electrónico te la envío?').\n"
             "        * Si prefiere otro número: pregúntale a qué número de WhatsApp se la envías.\n"
@@ -1584,15 +1582,15 @@ async def entrypoint(ctx: JobContext):
             "      - STEP 3.1 (STRICT CONFIRMATION GATE — NEVER AUTO-ASSIGN TODAY OR A TIME WHEN PROSPECT JUST SAYS 'OKAY'):\n"
             "        * BRANCH A (The prospect expresses doubt, hesitation, or 'but'): IT MEANS THEY HAVE NOT CONFIRMED YET. You are FORBIDDEN from asking what day they are available on this turn. Tailor your answer in your own words to address ONLY their specific question (value, 100% free with zero obligation, or painless cooling laser) without repeating previous replies. Finish with a PERIOD and ask: 'Are you open to trying it?'\n"
             "        * BRANCH B (The prospect says 'Okay', 'Sure, let's do it' accepting the assessment, but HAS NOT NAMED A DAY YET): You are STRICTLY FORBIDDEN from inventing or assigning today's date or nine AM on your own. You MUST ask: 'Perfect. What day this week or next week works best for you?'\n"
-            "      - STEP 3.2 (Offer 2 Real Open Options from <temporal_awareness> WITHOUT calling tools for this week or next week): When they mention a day this week or next week, read it directly from <temporal_awareness> (DO NOT call check_availability unless they ask for two or more weeks ahead). Open with a natural phrase ('Let's see, on Saturday...', 'Let me check real quick, for Friday...'), offer ONLY TWO initial options that are listed as open in <temporal_awareness> for that day (NEVER offer a time listed under 'ALREADY BOOKED IN DB'), put a PERIOD, and close with '. Which of those works better for you?'\n"
-            "      - STEP 3.3 (Slot Selection, Noon/Other Open Slots & Booked Times in DB):\n"
-            "        * IF THE PROSPECT PICKS ONE OF THE OFFERED TIMES (e.g., 'One PM', 'Ten AM') OR ASKS FOR A SPECIFIC TIME THAT IS OPEN IN <temporal_awareness>: You MUST reply using the exact structure of STEP 4.1: 'Perfect, that'll be [day and date without year] at [time in words]. I'll send the confirmation via WhatsApp and email. Should we use this same number for WhatsApp?'\n"
-            "        * IF THEY ASK WHAT OTHER MORNING, NOON, OR AFTERNOON TIMES ARE OPEN: Mention AT MOST TWO OR THREE open slots for that block from <temporal_awareness> (do not list six hours in a row), put a PERIOD, and end with 'Which of those works best for you?'\n"
-            "        * IF THEY ASK FOR A TIME LISTED UNDER 'ALREADY BOOKED IN DB' OR OUTSIDE OPERATING HOURS (before nine AM or after five PM): Naturally explain why, put a PERIOD, and offer two close open times ending with a question.\n"
+            "      - STEP 3.2 (Offer 2 Real Open Options from <temporal_awareness> WITHOUT calling tools for this week or next week): When they mention a day this week or next week, read it directly from <temporal_awareness> (DO NOT call check_availability unless they ask for two or more weeks ahead). Open with a natural phrase ('Let's see, on Saturday...', 'Let me check real quick, for Friday...'), offer ONLY TWO initial options that are open in <temporal_awareness> for that exact date, put a PERIOD, and close with '. Which of those works better for you?'\n"
+            "      - STEP 3.3 (Slot Selection, Noon/Other Open Slots & Exact Per-Date Check in DB):\n"
+            "        * IF THE PROSPECT PICKS A TIME OR ASKS FOR ANY HOUR BETWEEN NINE AM AND FIVE PM (e.g., 'Four PM', 'Noon', 'One PM'): Check ONLY the parentheses for THAT exact date in <temporal_awareness>. If that date says 'ALL OPEN 9am-5pm' or if that hour is NOT listed under 'BOOKED ONLY ON [that date]', IT IS AVAILABLE (even if you didn't mention it in your previous turn). Accept it immediately and reply using STEP 4.1: 'Perfect, that'll be [day and date without year] at [time in words]. I'll send the confirmation via WhatsApp and email. Should we use this same number for WhatsApp?'\n"
+            "        * IF THEY ASK WHAT OTHER MORNING, NOON, OR AFTERNOON TIMES ARE OPEN: Mention TWO OR THREE open slots for that block from <temporal_awareness>, put a PERIOD, and end with 'Which of those works best for you?'\n"
+            "        * ONLY IF THE REQUESTED HOUR IS EXPLICITLY LISTED UNDER 'BOOKED ONLY ON [that exact date]' OR OUTSIDE HOURS (before nine AM or after five PM): Naturally explain why, put a PERIOD, and offer two close open times ending with a question.\n"
             "    </phase>\n"
             "    <phase index=\"4\" name=\"mandatory_step_by_step_whatsapp_and_email_verification\">\n"
             "      CRITICAL UNBREAKABLE RULE: ONLY enter this phase after the prospect has explicitly chosen BOTH a DAY and a TIME. Separate sentences with a PERIOD:\n"
-            "      - STEP 4.1 (State Chosen Date/Time without Year & Ask WhatsApp): As soon as the time is chosen, use this exact structure: 'Perfect, that'll be [day and date without year] at [time in words]. I'll send the confirmation via WhatsApp and email. Should we use this same number for WhatsApp?' (e.g., 'Perfect, that'll be Saturday, November twenty-eighth at one in the afternoon. I'll send the confirmation via WhatsApp and email. Should we use this same number for WhatsApp?').\n"
+            "      - STEP 4.1 (State Chosen Date/Time without Year & Ask WhatsApp): As soon as the time is chosen, use this exact structure: 'Perfect, that'll be [day and date without year] at [time in words]. I'll send the confirmation via WhatsApp and email. Should we use this same number for WhatsApp?'\n"
             "      - STEP 4.2 (WhatsApp Yes / No Branch & Natural Phone Read-Back Loop):\n"
             "        * If YES: ask what email address you should send it to ('Sounds good, what's the best email address to send that to?').\n"
             "        * If NO: ask what phone number is best for WhatsApp ('Sure thing, what's the best phone number for your WhatsApp?').\n"
@@ -1856,6 +1854,7 @@ async def entrypoint(ctx: JobContext):
             language,
             booking_state.get("last_checked_iso_date", ""),
         )
+        written_display = _format_written_datetime(iso_date, iso_time, language)
 
         booking_payload = {
             "tenant_id": tenant_id,
@@ -1869,7 +1868,9 @@ async def entrypoint(ctx: JobContext):
             "appointment_date": iso_date,
             "appointment_time": iso_time,
             "appointment_at_iso": iso_full_at,
-            "appointment_display": (
+            "appointment_display": written_display,
+            "appointment_written": written_display,
+            "appointment_spoken": (
                 f"{spoken_date} a las {spoken_time}"
                 if language == "es"
                 else f"{spoken_date} at {spoken_time}"
