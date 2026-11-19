@@ -7,3 +7,5 @@ venv/
 
 .vscode/
 __pycache__/
+google_service_account.json
+.lk_quota_state.json

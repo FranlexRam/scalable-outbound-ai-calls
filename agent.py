@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -29,6 +30,13 @@ from livekit.agents.inference import (
 from livekit.agents.voice import Agent
 from livekit.agents.voice.room_io import RoomOptions
 from livekit.plugins import cartesia, deepgram, openai, silero
+
+try:
+    from google.auth.transport.requests import Request as GoogleAuthRequest
+    from google.oauth2 import service_account as google_service_account
+except ImportError:
+    GoogleAuthRequest = None
+    google_service_account = None
 
 # Pre-importar módulos internos de esquemas de herramientas para evitar bloqueos de 200ms en el Event Loop
 try:
@@ -61,6 +69,8 @@ DEFAULT_BUSINESS_ADDRESS = os.environ.get(
 DEFAULT_FROM_EMAIL = os.environ.get("RESEND_FROM_EMAIL", "Zen Spa <contact@plexuscode.com>")
 DEFAULT_REPLY_TO_EMAIL = os.environ.get("SPA_REPLY_TO_EMAIL", "")
 DEFAULT_ADMIN_EMAIL = os.environ.get("SPA_ADMIN_EMAIL", "")
+DEFAULT_GOOGLE_CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "").strip().strip("'\"")
+DEFAULT_GOOGLE_SA_FILE = os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE", "google_service_account.json").strip().strip("'\"")
 # Horario corrido de 9:00 AM a 5:00 PM (incluyendo 12:00 PM mediodía, 1:00 PM y 2:00 PM)
 DEFAULT_MORNING_HOURS = (9, 10, 11)
 DEFAULT_AFTERNOON_HOURS = (12, 13, 14, 15, 16, 17)
@@ -73,15 +83,16 @@ SECONDARY_OPENROUTER_LLM_MODEL = os.environ.get("SECONDARY_OPENROUTER_LLM_MODEL"
 QUOTA_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".lk_quota_state.json")
 
 _SHARED_SUPABASE_CLIENT: httpx.AsyncClient | None = None
+_GOOGLE_CAL_CREDS = None
 
 
 def _get_supabase_http_client() -> httpx.AsyncClient:
-    """Devuelve un cliente HTTP persistente (Keep-Alive TLS) para eliminar ~600ms de handshake en cada operación con Supabase y Resend."""
+    """Devuelve un cliente HTTP persistente (Keep-Alive TLS) para eliminar ~600ms de handshake en cada operación con Supabase, Resend y Google Calendar."""
     global _SHARED_SUPABASE_CLIENT
     if _SHARED_SUPABASE_CLIENT is None or _SHARED_SUPABASE_CLIENT.is_closed:
         _SHARED_SUPABASE_CLIENT = httpx.AsyncClient(
-            timeout=4.0,
-            limits=httpx.Limits(max_keepalive_connections=8, max_connections=16, keepalive_expiry=120.0),
+            timeout=5.0,
+            limits=httpx.Limits(max_keepalive_connections=10, max_connections=20, keepalive_expiry=120.0),
         )
     return _SHARED_SUPABASE_CLIENT
 
@@ -340,6 +351,34 @@ def _get_supabase_credentials() -> tuple[str, str]:
     return sb_url, sb_key
 
 
+async def _get_google_calendar_access_token() -> str:
+    """Obtiene y cachea en RAM un token OAuth2 de la Service Account sin bloquear el Event Loop de voz."""
+    global _GOOGLE_CAL_CREDS
+    if google_service_account is None or GoogleAuthRequest is None:
+        logger.warning("⚠️ [GCAL SKIPPED] google-auth is not installed in this venv.")
+        return ""
+
+    sa_file = os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE", DEFAULT_GOOGLE_SA_FILE).strip().strip("'\"")
+    if not os.path.isabs(sa_file):
+        sa_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), sa_file)
+    if not os.path.exists(sa_file):
+        logger.warning("⚠️ [GCAL SKIPPED] Service Account file not found at '%s'.", sa_file)
+        return ""
+
+    try:
+        if _GOOGLE_CAL_CREDS is None:
+            _GOOGLE_CAL_CREDS = google_service_account.Credentials.from_service_account_file(
+                sa_file,
+                scopes=["https://www.googleapis.com/auth/calendar"],
+            )
+        if not _GOOGLE_CAL_CREDS.valid or not _GOOGLE_CAL_CREDS.token:
+            await asyncio.to_thread(_GOOGLE_CAL_CREDS.refresh, GoogleAuthRequest())
+        return _GOOGLE_CAL_CREDS.token or ""
+    except Exception as exc:
+        logger.error("❌ [GCAL AUTH ERROR] Failed to obtain access token: %s", exc)
+        return ""
+
+
 async def _fetch_supabase_booked_slots(
     tenant_id: str,
     start_iso_date: str,
@@ -390,14 +429,113 @@ async def _fetch_supabase_booked_slots(
     return booked_map
 
 
-async def _fetch_booked_hours_for_date(tenant_id: str, iso_date: str) -> set[int]:
-    """Consulta en tiempo real en Supabase las horas ocupadas para una fecha específica."""
-    booked_map = await _fetch_supabase_booked_slots(tenant_id, iso_date, iso_date)
+async def _fetch_google_calendar_booked_slots(
+    calendar_id: str,
+    start_iso_date: str,
+    end_iso_date: str,
+) -> dict[str, set[int]]:
+    """Lee en tiempo real los eventos ocupados del Google Calendar del Spa para detectar bloqueos manuales."""
+    cal_id = calendar_id.strip().strip("'\"")
+    if not cal_id:
+        return {}
+    token = await _get_google_calendar_access_token()
+    if not token:
+        return {}
+
+    tz = ZoneInfo("America/Caracas")
+    time_min = f"{start_iso_date}T00:00:00-04:00"
+    time_max = f"{end_iso_date}T23:59:59-04:00"
+    endpoint = f"https://www.googleapis.com/calendar/v3/calendars/{quote(cal_id, safe='')}/events"
+    headers = {"Authorization": f"Bearer {token}"}
+    params = {
+        "timeMin": time_min,
+        "timeMax": time_max,
+        "singleEvents": "true",
+        "orderBy": "startTime",
+    }
+
+    booked_map: dict[str, set[int]] = {}
+    try:
+        client = _get_supabase_http_client()
+        resp = await client.get(endpoint, headers=headers, params=params)
+        if resp.status_code != 200:
+            logger.warning("⚠️ [GCAL PRE-FETCH] HTTP %d: %s", resp.status_code, resp.text[:200])
+            return {}
+
+        items = resp.json().get("items", [])
+        all_business_hours = set(DEFAULT_MORNING_HOURS + DEFAULT_AFTERNOON_HOURS)
+        for ev in items:
+            if ev.get("status") == "cancelled" or ev.get("transparency") == "transparent":
+                continue
+            start_obj = ev.get("start", {})
+            end_obj = ev.get("end", {})
+
+            if "dateTime" in start_obj:
+                s_raw = str(start_obj["dateTime"]).replace("Z", "+00:00")
+                e_raw = str(end_obj.get("dateTime", start_obj["dateTime"])).replace("Z", "+00:00")
+                s_dt = datetime.fromisoformat(s_raw).astimezone(tz)
+                e_dt = datetime.fromisoformat(e_raw).astimezone(tz)
+                if e_dt <= s_dt:
+                    e_dt = s_dt + timedelta(hours=1)
+                cursor = s_dt.replace(minute=0, second=0, microsecond=0)
+                while cursor < e_dt:
+                    d_key = cursor.strftime("%Y-%m-%d")
+                    if start_iso_date <= d_key <= end_iso_date and cursor.hour in all_business_hours:
+                        booked_map.setdefault(d_key, set()).add(cursor.hour)
+                    cursor += timedelta(hours=1)
+            elif "date" in start_obj:
+                s_date = datetime.strptime(start_obj["date"], "%Y-%m-%d").date()
+                e_date = datetime.strptime(end_obj.get("date", start_obj["date"]), "%Y-%m-%d").date()
+                if e_date <= s_date:
+                    e_date = s_date + timedelta(days=1)
+                d_cur = s_date
+                while d_cur < e_date:
+                    d_key = d_cur.strftime("%Y-%m-%d")
+                    if start_iso_date <= d_key <= end_iso_date:
+                        booked_map.setdefault(d_key, set()).update(all_business_hours)
+                    d_cur += timedelta(days=1)
+
+        logger.info(
+            "📆 [GCAL PRE-FETCH] Loaded %d active events from Google Calendar (%s to %s).",
+            len(items),
+            start_iso_date,
+            end_iso_date,
+        )
+    except Exception as exc:
+        logger.warning("⚠️ [GCAL PRE-FETCH EXCEPTION] %s", exc)
+    return booked_map
+
+
+async def _fetch_combined_booked_slots(
+    tenant_id: str,
+    calendar_id: str,
+    start_iso_date: str,
+    end_iso_date: str,
+) -> dict[str, set[int]]:
+    """Ejecuta en paralelo la consulta de Supabase y Google Calendar y fusiona ambos mapas de horarios ocupados."""
+    sb_map, gcal_map = await asyncio.gather(
+        _fetch_supabase_booked_slots(tenant_id, start_iso_date, end_iso_date),
+        _fetch_google_calendar_booked_slots(calendar_id, start_iso_date, end_iso_date),
+    )
+    merged: dict[str, set[int]] = {}
+    for src in (sb_map, gcal_map):
+        for d_key, hours_set in src.items():
+            merged.setdefault(d_key, set()).update(hours_set)
+    return merged
+
+
+async def _fetch_booked_hours_for_date(
+    tenant_id: str,
+    iso_date: str,
+    calendar_id: str = "",
+) -> set[int]:
+    """Consulta en tiempo real en Supabase y Google Calendar las horas ocupadas para una fecha específica."""
+    booked_map = await _fetch_combined_booked_slots(tenant_id, calendar_id, iso_date, iso_date)
     return booked_map.get(iso_date, set())
 
 
 def _format_day_slots_summary(iso_date: str, language: str, booked_hours: set[int]) -> str:
-    """Genera el resumen conciso y aislado por fecha de horas ocupadas y libres en Supabase."""
+    """Genera el resumen conciso y aislado por fecha de horas ocupadas y libres en Supabase/Google Calendar."""
     all_hours = DEFAULT_MORNING_HOURS + DEFAULT_AFTERNOON_HOURS
     free_all = [h for h in all_hours if h not in booked_hours]
 
@@ -474,6 +612,125 @@ async def _insert_appointment_supabase(payload: dict) -> tuple[bool, str, dict |
     except Exception as exc:
         logger.error("❌ [SUPABASE INSERT EXCEPTION] %s", exc)
         return False, str(exc), None
+
+
+async def _update_supabase_google_event_id(appointment_id: str, google_event_id: str) -> None:
+    """Guarda el google_event_id en public.spa_appointments para habilitar reagendamientos y cancelaciones automáticas."""
+    if not (appointment_id and google_event_id) or appointment_id == "N/A":
+        return
+    sb_url, sb_key = _get_supabase_credentials()
+    if not (sb_url and sb_key):
+        return
+
+    endpoint = f"{sb_url}/rest/v1/spa_appointments"
+    headers = {
+        "apikey": sb_key,
+        "Authorization": f"Bearer {sb_key}",
+        "Content-Type": "application/json",
+    }
+    params = [("id", f"eq.{appointment_id}")]
+    try:
+        client = _get_supabase_http_client()
+        resp = await client.patch(endpoint, headers=headers, params=params, json={"google_event_id": google_event_id})
+        if resp.status_code in (200, 204):
+            logger.info("🔗 [SUPABASE SYNC] Saved google_event_id='%s' for appointment='%s'", google_event_id, appointment_id)
+        else:
+            logger.warning("⚠️ [SUPABASE SYNC] HTTP %d updating google_event_id: %s", resp.status_code, resp.text[:200])
+    except Exception as exc:
+        logger.error("❌ [SUPABASE SYNC EXCEPTION] %s", exc)
+
+
+async def _create_google_calendar_event(booking_payload: dict) -> str:
+    """Pinta el bloque de 1 hora en el Google Calendar del Spa y vincula su ID en Supabase."""
+    cal_id = (booking_payload.get("google_calendar_id") or os.environ.get("GOOGLE_CALENDAR_ID", DEFAULT_GOOGLE_CALENDAR_ID)).strip().strip("'\"")
+    if not cal_id:
+        logger.warning("⚠️ [GCAL SKIPPED] GOOGLE_CALENDAR_ID not configured — skipping calendar event creation.")
+        return ""
+    token = await _get_google_calendar_access_token()
+    if not token:
+        return ""
+
+    start_iso = booking_payload.get("appointment_at_iso", "")
+    try:
+        start_dt = datetime.fromisoformat(start_iso)
+        end_dt = start_dt + timedelta(hours=1)
+        end_iso = end_dt.isoformat()
+    except Exception:
+        return ""
+
+    business_name = booking_payload.get("business_name") or DEFAULT_BUSINESS_NAME
+    service_name = booking_payload.get("service_name") or DEFAULT_SERVICE_NAME
+    business_address = booking_payload.get("business_address") or DEFAULT_BUSINESS_ADDRESS
+    client_name = booking_payload.get("client_name", "Cliente")
+    whatsapp_num = booking_payload.get("whatsapp_number", "")
+    client_email = booking_payload.get("email", "")
+    appointment_id = booking_payload.get("appointment_id", "N/A")
+    direction_label = "Llamada Saliente IA" if booking_payload.get("call_direction") == "outbound" else "Llamada Entrante IA"
+
+    event_body = {
+        "summary": f"{service_name} — {client_name}",
+        "location": business_address,
+        "description": (
+            f"Cliente: {client_name}\n"
+            f"Servicio: {service_name}\n"
+            f"WhatsApp: {whatsapp_num}\n"
+            f"Correo: {client_email}\n"
+            f"Canal: {direction_label}\n"
+            f"Negocio: {business_name}\n"
+            f"Supabase ID: {appointment_id}"
+        ),
+        "start": {"dateTime": start_iso, "timeZone": "America/Caracas"},
+        "end": {"dateTime": end_iso, "timeZone": "America/Caracas"},
+        "colorId": "7",
+    }
+
+    endpoint = f"https://www.googleapis.com/calendar/v3/calendars/{quote(cal_id, safe='')}/events"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    try:
+        client = _get_supabase_http_client()
+        resp = await client.post(endpoint, headers=headers, json=event_body)
+        if resp.status_code in (200, 201):
+            ev_data = resp.json()
+            ev_id = ev_data.get("id", "")
+            logger.info(
+                "📆 [GCAL EVENT CREATED] id='%s' | summary='%s' | start='%s'",
+                ev_id,
+                event_body["summary"],
+                start_iso,
+            )
+            if ev_id and appointment_id != "N/A":
+                await _update_supabase_google_event_id(appointment_id, ev_id)
+            return ev_id
+        logger.warning("⚠️ [GCAL CREATE ERROR] HTTP %d: %s", resp.status_code, resp.text[:250])
+        return ""
+    except Exception as exc:
+        logger.error("❌ [GCAL CREATE EXCEPTION] %s", exc)
+        return ""
+
+
+def _build_google_calendar_client_link(booking_payload: dict) -> str:
+    """Genera el enlace de 1 clic 'Agregar a mi Google Calendar' para el correo del cliente."""
+    try:
+        start_dt = datetime.fromisoformat(booking_payload["appointment_at_iso"]).astimezone(ZoneInfo("UTC"))
+        end_dt = start_dt + timedelta(hours=1)
+        dates_param = f"{start_dt.strftime('%Y%m%dT%H%M%SZ')}/{end_dt.strftime('%Y%m%dT%H%M%SZ')}"
+        business_name = booking_payload.get("business_name") or DEFAULT_BUSINESS_NAME
+        service_name = booking_payload.get("service_name") or DEFAULT_SERVICE_NAME
+        address = booking_payload.get("business_address") or DEFAULT_BUSINESS_ADDRESS
+        title = f"{service_name} — {business_name}"
+        details = f"Cita confirmada en {business_name}. Servicio: {service_name}."
+        return (
+            "https://calendar.google.com/calendar/render?action=TEMPLATE"
+            f"&text={quote(title)}"
+            f"&dates={dates_param}"
+            f"&details={quote(details)}"
+            f"&location={quote(address)}"
+        )
+    except Exception:
+        return ""
 
 
 async def _send_resend_email(
@@ -553,10 +810,25 @@ async def _dispatch_bilateral_email_notifications(booking_payload: dict) -> None
     written_dt_es = _format_written_datetime(iso_date, iso_time, "es")
     appointment_id = booking_payload.get("appointment_id", "N/A")
     direction_label = "Llamada Saliente IA" if booking_payload.get("call_direction") == "outbound" else "Llamada Entrante IA"
+    gcal_client_url = _build_google_calendar_client_link(booking_payload)
+    gcal_btn_es = (
+        f'<div style="text-align: center; margin: 22px 0;">'
+        f'<a href="{gcal_client_url}" target="_blank" style="display: inline-block; background-color: #0d9488; color: #ffffff; text-decoration: none; font-weight: 600; font-size: 14px; padding: 11px 22px; border-radius: 8px;">📅 Agregar a mi Google Calendar</a>'
+        f"</div>"
+        if gcal_client_url
+        else ""
+    )
+    gcal_btn_en = (
+        f'<div style="text-align: center; margin: 22px 0;">'
+        f'<a href="{gcal_client_url}" target="_blank" style="display: inline-block; background-color: #0d9488; color: #ffffff; text-decoration: none; font-weight: 600; font-size: 14px; padding: 11px 22px; border-radius: 8px;">📅 Add to my Google Calendar</a>'
+        f"</div>"
+        if gcal_client_url
+        else ""
+    )
 
     tasks = []
 
-    # 1. Correo de Confirmación para el Cliente (ES / EN) con Fecha y Hora en formato ejecutivo
+    # 1. Correo de Confirmación para el Cliente (ES / EN) con Fecha/Hora ejecutiva y botón de 1 clic para Google Calendar
     if client_email and "@" in client_email:
         if lang == "es":
             client_subject = f"✅ Cita Confirmada en {business_name} — {written_dt}"
@@ -572,6 +844,7 @@ async def _dispatch_bilateral_email_notifications(booking_payload: dict) -> None
                     <p style="margin: 6px 0;"><strong>📍 Dirección:</strong> {business_address}</p>
                     <p style="margin: 6px 0;"><strong>📱 WhatsApp registrado:</strong> {whatsapp_num}</p>
                 </div>
+                {gcal_btn_es}
                 <p style="font-size: 14px; line-height: 1.5; color: #4b5563;">
                     🔔 <strong>Recordatorio automático:</strong> Te enviaremos un mensaje por WhatsApp 24 horas antes de tu cita para confirmar tu asistencia o ayudarte si necesitas reagendar.
                 </p>
@@ -595,6 +868,7 @@ async def _dispatch_bilateral_email_notifications(booking_payload: dict) -> None
                     <p style="margin: 6px 0;"><strong>📍 Location:</strong> {business_address}</p>
                     <p style="margin: 6px 0;"><strong>📱 Registered WhatsApp:</strong> {whatsapp_num}</p>
                 </div>
+                {gcal_btn_en}
                 <p style="font-size: 14px; line-height: 1.5; color: #4b5563;">
                     🔔 <strong>Automated Reminder:</strong> We'll send you a WhatsApp message 24 hours before your appointment so you can easily confirm or reschedule if needed.
                 </p>
@@ -623,7 +897,7 @@ async def _dispatch_bilateral_email_notifications(booking_payload: dict) -> None
         <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 580px; margin: 0 auto; padding: 26px; border: 1px solid #cbd5e1; border-radius: 14px; background-color: #f8fafc; color: #0f172a;">
             <h2 style="margin-top: 0; color: #1e293b;">🔔 Nueva Cita Registrada en {business_name}</h2>
             <p style="font-size: 14px; color: #475569;">
-                El agente de voz IA ha verificado y registrado una nueva cita directamente en Supabase:
+                El agente de voz IA ha verificado y registrado una nueva cita en Supabase y Google Calendar:
             </p>
             <div style="background-color: #ffffff; border: 1px solid #e2e8f0; padding: 16px; border-radius: 10px; margin: 16px 0;">
                 <p style="margin: 6px 0;"><strong>👤 Cliente:</strong> {client_name}</p>
@@ -653,6 +927,15 @@ async def _dispatch_bilateral_email_notifications(booking_payload: dict) -> None
 
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _dispatch_post_booking_integrations(booking_payload: dict) -> None:
+    """Ejecuta en paralelo (0ms de impacto en voz) Resend Bilateral + Google Calendar del Spa + Sync en Supabase."""
+    await asyncio.gather(
+        _dispatch_bilateral_email_notifications(booking_payload),
+        _create_google_calendar_event(booking_payload),
+        return_exceptions=True,
+    )
 
 
 def _format_to_e164_ve(raw_input: str) -> str:
@@ -1375,7 +1658,7 @@ async def _terminate_call_session(
         active_tasks = [t for t in pending_tasks if not t.done()]
         if active_tasks:
             try:
-                await asyncio.wait_for(asyncio.gather(*active_tasks, return_exceptions=True), timeout=4.0)
+                await asyncio.wait_for(asyncio.gather(*active_tasks, return_exceptions=True), timeout=5.0)
             except Exception:
                 pass
 
@@ -1422,6 +1705,10 @@ async def entrypoint(ctx: JobContext):
     from_email: str = metadata.get("from_email") or os.environ.get("RESEND_FROM_EMAIL", DEFAULT_FROM_EMAIL)
     reply_to_email: str = metadata.get("reply_to_email") or os.environ.get("SPA_REPLY_TO_EMAIL", DEFAULT_REPLY_TO_EMAIL)
     admin_email: str = metadata.get("admin_email") or os.environ.get("SPA_ADMIN_EMAIL", DEFAULT_ADMIN_EMAIL)
+    google_calendar_id: str = (
+        metadata.get("google_calendar_id")
+        or os.environ.get("GOOGLE_CALENDAR_ID", DEFAULT_GOOGLE_CALENDAR_ID)
+    ).strip().strip("'\"")
 
     phone_number: str = (
         metadata.get("phone_number")
@@ -1477,12 +1764,13 @@ async def entrypoint(ctx: JobContext):
         or os.environ.get("DEFAULT_BUSINESS_HOURS", "")
     )
 
-    # Pre-Fetch asíncrono de disponibilidad real en Supabase para los próximos 14 días (abre el socket Keep-Alive)
+    # Pre-Fetch asíncrono en paralelo: Supabase + Google Calendar del Spa para los próximos 14 días
     now_ve = datetime.now(ZoneInfo("America/Caracas"))
     monday_this_wk = now_ve - timedelta(days=now_ve.weekday())
     sunday_next_wk = monday_this_wk + timedelta(days=13)
-    booked_slots_cache: dict[str, set[int]] = await _fetch_supabase_booked_slots(
+    booked_slots_cache: dict[str, set[int]] = await _fetch_combined_booked_slots(
         tenant_id=tenant_id,
+        calendar_id=google_calendar_id,
         start_iso_date=now_ve.strftime("%Y-%m-%d"),
         end_iso_date=sunday_next_wk.strftime("%Y-%m-%d"),
     )
@@ -1520,17 +1808,17 @@ async def entrypoint(ctx: JobContext):
             "    </phase>\n"
             "    <phase index=\"3\" name=\"turno_3_compuerta_estricta_de_confirmacion_y_agenda_dinamica_supabase\">\n"
             "      - PASO 3.1 (COMPUERTA ESTRICTA DE CONFIRMACIÓN — PROHIBIDO ASIGNAR HOY O UNA HORA CUANDO EL CLIENTE SOLO DICE 'OK'):\n"
-            "        * RAMA A (El cliente expresa duda, temor o 'pero'): SIGNIFICA QUE AÚN NO HA CONFIRMADO. Está PROHIBIDO pedirle días o fechas en este turno. Responde con tus propias palabras ÚNICAMENTE a su duda puntual (valor, gratuidad sin obligación de compra, o comodidad del láser frío sin dolor) sin repetir argumentos previos. Cierra con PUNTO SEGUIDO y pregunta: '¿Te animas a probarlo?'\n"
+            "        * RAMA A (El cliente hace una pregunta, expresa duda, temor o dice 'pero'): Responde PRIMERO de forma directa, natural y empática a su pregunta exacta (por ejemplo: flexibilidad para escoger el día y hora que prefiera, gratuidad sin obligación de compra, o comodidad del láser frío sin dolor), sin pedirle días todavía y sin repetir metainstrucciones internas. Cierra con PUNTO SEGUIDO y pregunta: '¿Te animas a probarlo?'\n"
             "        * RAMA B (El cliente dice 'Ok', 'Bueno, está bien', 'Sí, dale' aceptando probar la valoración, pero AÚN NO HA DICHO QUÉ DÍA QUIERE): Está TERMINANTEMENTE PROHIBIDO inventar o asignarle el día de hoy o las nueve de la mañana por tu cuenta. Cuando el cliente solo dice 'Ok' para aceptar la valoración, pregúntale obligatoriamente: 'Perfecto. ¿Qué día de esta semana o de la próxima te queda bien?'\n"
             "      - PASO 3.2 (Dar Disponibilidad Real de Supabase en 2 Opciones SIN usar herramientas para esta semana o la próxima): Cuando el cliente mencione un día de esta semana o de la próxima, léelo directamente de <temporal_awareness> (NO invoques check_availability salvo que pida dos o más semanas en el futuro). Abre con una expresión humana natural ('A ver, déjame ver, el sábado...', 'Eeh, ya te digo, para el viernes...'), ofrece SOLO DOS opciones iniciales que figuren libres en <temporal_awareness> para esa fecha exacta, pon un PUNTO SEGUIDO y cierra con '. ¿Cuál de las dos te queda mejor?'\n"
             "      - PASO 3.3 (Selección de Hora, Mediodía/Otros Horarios y Verificación Exacta por Fecha en DB):\n"
-            "        * SI EL CLIENTE ELIGE UNA HORA O PIDE CUALQUIER HORA ENTRE NUEVE DE LA MAÑANA Y CINCO DE LA TARDE (ej. 'A las cuatro', 'Al mediodía', 'A la una'): Revisa en <temporal_awareness> ÚNICAMENTE el paréntesis de ESA fecha exacta. Si esa fecha dice 'TODO LIBRE 9am-5pm' o si esa hora NO está listada en 'OCUPADO SOLO EL [fecha]' de ese mismo día, SIGNIFICA QUE SÍ ESTÁ LIBRE (aunque no la hayas nombrado en tu turno anterior). Acéptala de inmediato y responde con la estructura del PASO 4.1: 'Perfecto, entonces sería el [día y fecha sin año] a las [hora en letras]. Te envío la confirmación por WhatsApp y correo. ¿Usas este mismo número para tu WhatsApp?'\n"
+            "        * SI EL CLIENTE ELIGE UNA HORA O PIDE CUALQUIER HORA ENTRE NUEVE DE LA MAÑANA Y CINCO DE LA TARDE (ej. 'A las cuatro', 'Al mediodía', 'A la una'): Revisa en <temporal_awareness> ÚNICAMENTE el paréntesis de ESA fecha exacta. Si esa fecha dice 'TODO LIBRE 9am-5pm' o si esa hora NO está listada en 'OCUPADO SOLO EL [fecha]' de ese mismo día, SIGNIFICA QUE SÍ ESTÁ LIBRE (aunque no la hayas nombrado en tu turno anterior). Acéptala de inmediato y responde con la estructura del PASO 4.1: 'Perfecto, entonces sería el [día y fecha sin año] [a la/a las según corresponda] [hora en letras]. Te envío la confirmación por WhatsApp y correo. ¿Usas este mismo número para tu WhatsApp?'\n"
             "        * SI PREGUNTA QUÉ OTROS HORARIOS TIENES EN LA MAÑANA, MEDIODÍA O TARDE: Abre con una expresión natural ('Eh, mira, en la tarde tengo...', 'Pues mira, también me queda...'), menciona DOS O TRES opciones libres de ese bloque según <temporal_awareness>, pon un PUNTO SEGUIDO y cierra con '¿Cuál te queda mejor?'\n"
             "        * ÚNICAMENTE SI LA HORA PEDIDA APARECE EXPLÍCITAMENTE EN 'OCUPADO SOLO EL [esa misma fecha]' O ES FUERA DE HORARIO (antes de las nueve o después de las cinco): Explícale el motivo y ofrécele dos horas libres cercanas cerrando con pregunta.\n"
             "    </phase>\n"
             "    <phase index=\"4\" name=\"confirmacion_obligatoria_paso_a_paso_whatsapp_y_correo\">\n"
             "      REGLA CRÍTICA INQUEBRANTABLE: SOLO entra a esta fase cuando el cliente YA haya elegido TANTO el DÍA como la HORA. Haz una sola pregunta corta por turno separando las oraciones con PUNTO SEGUIDO:\n"
-            "      - PASO 4.1 (Confirmar Fecha/Hora Elegida sin Año y Preguntar WhatsApp): Apenas el cliente elija la hora (ej. 'A las cuatro', 'A las tres'), di exactamente esta estructura: 'Perfecto, entonces sería el [día y fecha sin año] a las [hora en letras]. Te envío la confirmación por WhatsApp y correo. ¿Usas este mismo número para tu WhatsApp?'\n"
+            "      - PASO 4.1 (Confirmar Fecha/Hora Elegida sin Año y Preguntar WhatsApp): Apenas el cliente elija la hora (ej. 'A las cuatro', 'A la una'), di exactamente esta estructura (usando 'a la una' para la 1pm y 'a las' para las demás horas): 'Perfecto, entonces sería el [día y fecha sin año] [a la/a las] [hora en letras]. Te envío la confirmación por WhatsApp y correo. ¿Usas este mismo número para tu WhatsApp?'\n"
             "      - PASO 4.2 (Rama Sí / Rama No y Verificación en Bucle del WhatsApp con Pausas):\n"
             "        * Si confirma que usa ese mismo número: pídele su correo electrónico ('Listo, ¿a qué correo electrónico te la envío?').\n"
             "        * Si prefiere otro número: pregúntale a qué número de WhatsApp se la envías.\n"
@@ -1580,7 +1868,7 @@ async def entrypoint(ctx: JobContext):
             "    </phase>\n"
             "    <phase index=\"3\" name=\"turn_3_strict_confirmation_gate_and_dynamic_supabase_scheduling\">\n"
             "      - STEP 3.1 (STRICT CONFIRMATION GATE — NEVER AUTO-ASSIGN TODAY OR A TIME WHEN PROSPECT JUST SAYS 'OKAY'):\n"
-            "        * BRANCH A (The prospect expresses doubt, hesitation, or 'but'): IT MEANS THEY HAVE NOT CONFIRMED YET. You are FORBIDDEN from asking what day they are available on this turn. Tailor your answer in your own words to address ONLY their specific question (value, 100% free with zero obligation, or painless cooling laser) without repeating previous replies. Finish with a PERIOD and ask: 'Are you open to trying it?'\n"
+            "        * BRANCH A (The prospect asks a question, expresses doubt, hesitation, or says 'but'): Answer their exact question FIRST in a warm, direct way using your own words (e.g., total flexibility to pick any day and time that works for them, 100% free with zero obligation, or painless cooling laser), without asking for days yet and without repeating internal prompt notes. Finish with a PERIOD and ask: 'Are you open to trying it?'\n"
             "        * BRANCH B (The prospect says 'Okay', 'Sure, let's do it' accepting the assessment, but HAS NOT NAMED A DAY YET): You are STRICTLY FORBIDDEN from inventing or assigning today's date or nine AM on your own. You MUST ask: 'Perfect. What day this week or next week works best for you?'\n"
             "      - STEP 3.2 (Offer 2 Real Open Options from <temporal_awareness> WITHOUT calling tools for this week or next week): When they mention a day this week or next week, read it directly from <temporal_awareness> (DO NOT call check_availability unless they ask for two or more weeks ahead). Open with a natural phrase ('Let's see, on Saturday...', 'Let me check real quick, for Friday...'), offer ONLY TWO initial options that are open in <temporal_awareness> for that exact date, put a PERIOD, and close with '. Which of those works better for you?'\n"
             "      - STEP 3.3 (Slot Selection, Noon/Other Open Slots & Exact Per-Date Check in DB):\n"
@@ -1673,8 +1961,8 @@ async def entrypoint(ctx: JobContext):
 
     @llm.function_tool(
         description=(
-            "Queries real-time availability in Supabase ONLY when the client asks for a date TWO OR MORE WEEKS in the future (weeks_ahead >= 2). "
-            "DO NOT call this tool for today, tomorrow, this week (weeks_ahead=0), or next week (weeks_ahead=1) because their real-time Supabase availability is ALREADY loaded in <temporal_awareness>."
+            "Queries real-time availability in Supabase and Google Calendar ONLY when the client asks for a date TWO OR MORE WEEKS in the future (weeks_ahead >= 2). "
+            "DO NOT call this tool for today, tomorrow, this week (weeks_ahead=0), or next week (weeks_ahead=1) because their real-time availability is ALREADY loaded in <temporal_awareness>."
         )
     )
     async def check_availability(
@@ -1711,17 +1999,17 @@ async def entrypoint(ctx: JobContext):
         booking_state["last_checked_iso_date"] = req_iso
         req_phonetic = _format_date_phonetic(target_dt, language)
 
-        # Consultar disponibilidad real en Supabase para esa fecha
+        # Consultar disponibilidad real en caché o en Supabase + Google Calendar
         if req_iso in booked_slots_cache:
             booked_hours = booked_slots_cache[req_iso]
         else:
-            booked_hours = await _fetch_booked_hours_for_date(tenant_id, req_iso)
+            booked_hours = await _fetch_booked_hours_for_date(tenant_id, req_iso, google_calendar_id)
             booked_slots_cache[req_iso] = booked_hours
 
         slots_summary = _format_day_slots_summary(req_iso, language, booked_hours)
 
         logger.info(
-            "📅 [SUPABASE CALENDAR TOOL] day='%s' weeks_ahead=%d -> %s (%s) | %s",
+            "📅 [SUPABASE/GCAL CALENDAR TOOL] day='%s' weeks_ahead=%d -> %s (%s) | %s",
             day_of_week,
             weeks_ahead,
             req_phonetic,
@@ -1731,19 +2019,19 @@ async def entrypoint(ctx: JobContext):
 
         if language == "es":
             return (
-                f"RESULTADO EXACTO DE SUPABASE PARA {req_phonetic.upper()} (ISO: {req_iso}):\n"
-                f"- Estado de cupos en base de datos: {slots_summary}.\n"
+                f"RESULTADO EXACTO DE AGENDA PARA {req_phonetic.upper()} (ISO: {req_iso}):\n"
+                f"- Estado de cupos en base de datos y calendario: {slots_summary}.\n"
                 f"- INSTRUCCIÓN DE RESPUESTA: Abre con una expresión humana natural ('A ver, déjame ver, el {req_phonetic}...', 'Eeh, ya te digo, el {req_phonetic}...'; PROHIBIDO escribir 'Mmm'), NO digas el año al hablar, ofrece primero SOLO DOS opciones que estén LIBRES (jamás ofrezcas horas ocupadas), pon un PUNTO SEGUIDO y cierra con una pregunta corta ('. ¿Cuál de las dos te queda mejor?')."
             )
         return (
-            f"EXACT SUPABASE RESULT FOR {req_phonetic.upper()} (ISO: {req_iso}):\n"
-            f"- Real-time database slot status: {slots_summary}.\n"
+            f"EXACT SCHEDULE RESULT FOR {req_phonetic.upper()} (ISO: {req_iso}):\n"
+            f"- Real-time database & calendar slot status: {slots_summary}.\n"
             f"- RESPONSE INSTRUCTION: Open with a natural transition ('Let's see, on {req_phonetic}...' or 'Let me check real quick, on {req_phonetic}...'; NEVER write 'Mmm'), DO NOT say the year out loud, offer ONLY TWO initial options that are OPEN (never offer booked times), put a PERIOD, and end with a short question ('. Which of those works better for you?')."
         )
 
     @llm.function_tool(
         description=(
-            "Formally books and persists the appointment in Supabase ONLY AFTER reading back both the WhatsApp number (if a different one was given) and the email address "
+            "Formally books and persists the appointment in Supabase and Google Calendar ONLY AFTER reading back both the WhatsApp number (if a different one was given) and the email address "
             "and receiving the client's YES confirmation. Pass appointment_date in ISO 'YYYY-MM-DD' format and appointment_time in 24h 'HH:MM' format."
         )
     )
@@ -1855,6 +2143,7 @@ async def entrypoint(ctx: JobContext):
             booking_state.get("last_checked_iso_date", ""),
         )
         written_display = _format_written_datetime(iso_date, iso_time, language)
+        time_prep_es = "a la" if spoken_time.startswith("una") else "a las"
 
         booking_payload = {
             "tenant_id": tenant_id,
@@ -1864,6 +2153,7 @@ async def entrypoint(ctx: JobContext):
             "from_email": from_email,
             "reply_to_email": reply_to_email,
             "admin_email": admin_email,
+            "google_calendar_id": google_calendar_id,
             "client_name": contact_name or ("Cliente" if language == "es" else "Prospect"),
             "appointment_date": iso_date,
             "appointment_time": iso_time,
@@ -1871,7 +2161,7 @@ async def entrypoint(ctx: JobContext):
             "appointment_display": written_display,
             "appointment_written": written_display,
             "appointment_spoken": (
-                f"{spoken_date} a las {spoken_time}"
+                f"{spoken_date} {time_prep_es} {spoken_time}"
                 if language == "es"
                 else f"{spoken_date} at {spoken_time}"
             ),
@@ -1885,12 +2175,12 @@ async def entrypoint(ctx: JobContext):
         # Inserción atómica en Supabase reutilizando el cliente HTTP Keep-Alive
         inserted_ok, status_reason, created_row = await _insert_appointment_supabase(booking_payload)
         if not inserted_ok and status_reason == "slot_taken":
-            updated_booked = await _fetch_booked_hours_for_date(tenant_id, iso_date)
+            updated_booked = await _fetch_booked_hours_for_date(tenant_id, iso_date, google_calendar_id)
             booked_slots_cache[iso_date] = updated_booked
             new_summary = _format_day_slots_summary(iso_date, language, updated_booked)
             if language == "es":
                 return (
-                    f"ATENCIÓN - NO CUELGUES: El turno del {spoken_date} a las {spoken_time} acaba de ser ocupado en la base de datos. "
+                    f"ATENCIÓN - NO CUELGUES: El turno del {spoken_date} {time_prep_es} {spoken_time} acaba de ser ocupado en la base de datos. "
                     f"Horarios libres restantes para ese día: {new_summary}. "
                     "Disculpate con naturalidad diciendo que ese turno se acaba de ocupar y pregúntale cuál de los otros horarios disponibles prefiere."
                 )
@@ -1908,8 +2198,8 @@ async def entrypoint(ctx: JobContext):
         booked_slots_cache.setdefault(iso_date, set()).add(booked_hour_int)
         logger.info("✅ [BOOKING CONFIRMED & PERSISTED IN SUPABASE] %s", json.dumps(booking_payload, ensure_ascii=False))
 
-        # Disparo asíncrono en segundo plano de los correos bilaterales (Cliente + Spa) con 0ms de impacto en voz
-        notif_task = asyncio.create_task(_dispatch_bilateral_email_notifications(booking_payload))
+        # Disparo asíncrono en paralelo: Resend Bilateral + Google Calendar del Spa + Sync google_event_id (0ms impacto en voz)
+        notif_task = asyncio.create_task(_dispatch_post_booking_integrations(booking_payload))
         pending_notification_tasks.append(notif_task)
 
         if not call_ending:
@@ -1930,7 +2220,7 @@ async def entrypoint(ctx: JobContext):
             return (
                 f"Cita guardada exitosamente en Supabase ({iso_date} {iso_time}). "
                 f"Ahora despídete separando las ideas con PUNTO SEGUIDO y diciendo EXACTAMENTE así (SIN DECIR EL AÑO): "
-                f"'Listo, {client_label}, tu cita para el {spoken_date} a las {spoken_time} ya quedó agendada. En segundos te llega la confirmación por WhatsApp y correo. Que pases {dynamic_farewell}.'"
+                f"'Listo, {client_label}, tu cita para el {spoken_date} {time_prep_es} {spoken_time} ya quedó agendada. En segundos te llega la confirmación por WhatsApp y correo. Que pases {dynamic_farewell}.'"
             )
         return (
             f"Appointment saved in Supabase ({iso_date} {iso_time}). "
