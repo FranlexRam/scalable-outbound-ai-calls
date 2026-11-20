@@ -31,6 +31,8 @@ from livekit.agents.voice import Agent
 from livekit.agents.voice.room_io import RoomOptions
 from livekit.plugins import cartesia, deepgram, openai, silero
 
+from whatsapp_client import dispatch_bilateral_whatsapp_notifications
+
 try:
     from google.auth.transport.requests import Request as GoogleAuthRequest
     from google.oauth2 import service_account as google_service_account
@@ -71,6 +73,8 @@ DEFAULT_REPLY_TO_EMAIL = os.environ.get("SPA_REPLY_TO_EMAIL", "")
 DEFAULT_ADMIN_EMAIL = os.environ.get("SPA_ADMIN_EMAIL", "")
 DEFAULT_GOOGLE_CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "").strip().strip("'\"")
 DEFAULT_GOOGLE_SA_FILE = os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE", "google_service_account.json").strip().strip("'\"")
+DEFAULT_WHATSAPP_PHONE_NUMBER_ID = os.environ.get("WHATSAPP_PHONE_NUMBER_ID", "").strip().strip("'\"")
+DEFAULT_WHATSAPP_ADMIN_PHONE = os.environ.get("WHATSAPP_ADMIN_PHONE", "").strip().strip("'\"")
 # Horario corrido de 9:00 AM a 5:00 PM (incluyendo 12:00 PM mediodía, 1:00 PM y 2:00 PM)
 DEFAULT_MORNING_HOURS = (9, 10, 11)
 DEFAULT_AFTERNOON_HOURS = (12, 13, 14, 15, 16, 17)
@@ -87,7 +91,7 @@ _GOOGLE_CAL_CREDS = None
 
 
 def _get_supabase_http_client() -> httpx.AsyncClient:
-    """Devuelve un cliente HTTP persistente (Keep-Alive TLS) para eliminar ~600ms de handshake en cada operación con Supabase, Resend y Google Calendar."""
+    """Devuelve un cliente HTTP persistente (Keep-Alive TLS) para eliminar ~600ms de handshake en cada operación con Supabase, Resend, Google Calendar y WhatsApp."""
     global _SHARED_SUPABASE_CLIENT
     if _SHARED_SUPABASE_CLIENT is None or _SHARED_SUPABASE_CLIENT.is_closed:
         _SHARED_SUPABASE_CLIENT = httpx.AsyncClient(
@@ -930,10 +934,14 @@ async def _dispatch_bilateral_email_notifications(booking_payload: dict) -> None
 
 
 async def _dispatch_post_booking_integrations(booking_payload: dict) -> None:
-    """Ejecuta en paralelo (0ms de impacto en voz) Resend Bilateral + Google Calendar del Spa + Sync en Supabase."""
+    """Ejecuta en paralelo (0ms de impacto en voz) Resend Bilateral + Google Calendar del Spa + WhatsApp Bilateral."""
     await asyncio.gather(
         _dispatch_bilateral_email_notifications(booking_payload),
         _create_google_calendar_event(booking_payload),
+        dispatch_bilateral_whatsapp_notifications(
+            booking_payload,
+            http_client=_get_supabase_http_client(),
+        ),
         return_exceptions=True,
     )
 
@@ -1709,6 +1717,14 @@ async def entrypoint(ctx: JobContext):
         metadata.get("google_calendar_id")
         or os.environ.get("GOOGLE_CALENDAR_ID", DEFAULT_GOOGLE_CALENDAR_ID)
     ).strip().strip("'\"")
+    whatsapp_phone_number_id: str = (
+        metadata.get("whatsapp_phone_number_id")
+        or os.environ.get("WHATSAPP_PHONE_NUMBER_ID", DEFAULT_WHATSAPP_PHONE_NUMBER_ID)
+    ).strip().strip("'\"")
+    whatsapp_admin_phone: str = (
+        metadata.get("whatsapp_admin_phone")
+        or os.environ.get("WHATSAPP_ADMIN_PHONE", DEFAULT_WHATSAPP_ADMIN_PHONE)
+    ).strip().strip("'\"")
 
     phone_number: str = (
         metadata.get("phone_number")
@@ -2154,6 +2170,8 @@ async def entrypoint(ctx: JobContext):
             "reply_to_email": reply_to_email,
             "admin_email": admin_email,
             "google_calendar_id": google_calendar_id,
+            "whatsapp_phone_number_id": whatsapp_phone_number_id,
+            "whatsapp_admin_phone": whatsapp_admin_phone,
             "client_name": contact_name or ("Cliente" if language == "es" else "Prospect"),
             "appointment_date": iso_date,
             "appointment_time": iso_time,
@@ -2198,7 +2216,7 @@ async def entrypoint(ctx: JobContext):
         booked_slots_cache.setdefault(iso_date, set()).add(booked_hour_int)
         logger.info("✅ [BOOKING CONFIRMED & PERSISTED IN SUPABASE] %s", json.dumps(booking_payload, ensure_ascii=False))
 
-        # Disparo asíncrono en paralelo: Resend Bilateral + Google Calendar del Spa + Sync google_event_id (0ms impacto en voz)
+        # Disparo asíncrono en paralelo: Resend Bilateral + Google Calendar del Spa + WhatsApp Bilateral (0ms impacto en voz)
         notif_task = asyncio.create_task(_dispatch_post_booking_integrations(booking_payload))
         pending_notification_tasks.append(notif_task)
 
